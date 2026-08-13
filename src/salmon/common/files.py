@@ -80,8 +80,9 @@ async def process_files(
     """Process files concurrently using anyio with a capacity limiter."""
     results: list[T | None] = [None] * len(files)
     limiter = anyio.CapacityLimiter(cfg.upload.simultaneous_threads)
+    workers = min(len(files), cfg.upload.simultaneous_threads)
 
-    with tqdm(total=len(files), desc=desc, colour="cyan") as pbar:
+    with tqdm(total=len(files), desc=f"{desc} ({workers} workers)", colour="cyan") as pbar:
 
         async def process_with_result(file: str, idx: int) -> None:
             async with limiter:
