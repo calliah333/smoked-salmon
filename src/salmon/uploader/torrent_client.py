@@ -1,12 +1,40 @@
 import base64
 import os
 import xmlrpc.client
+from dataclasses import dataclass
 from urllib.parse import unquote, urlparse
 
 import asyncclick as click
 import qbittorrentapi
 import transmission_rpc
 from deluge_client import DelugeRPCClient
+
+
+@dataclass(frozen=True)
+class TorrentClientTorrent:
+    """Completed torrent exposed by a configured download client."""
+
+    name: str
+    hash: str
+    content_path: str
+    save_path: str
+    category: str
+
+
+def _redacted_client_url(url: str) -> str:
+    parsed = urlparse(url)
+    hostname = parsed.hostname or ""
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    netloc = f"{hostname}:{parsed.port}" if parsed.port else hostname
+    if parsed.username or parsed.password:
+        netloc = f"****:****@{netloc}"
+
+    path = parsed.path
+    if "/proxy/" in path:
+        prefix, _ = path.split("/proxy/", 1)
+        path = f"{prefix}/proxy/****"
+    return parsed._replace(netloc=netloc, path=path).geturl()
 
 
 class TorrentClient:
@@ -54,9 +82,31 @@ class QBittorrentClient(TorrentClient):
             click.secho("APIConnectionError: Incorrect host or port", fg="red", bold=True)
             return None
 
-    def add_to_downloader(self, remote_folder, torrent, is_paused, label):
+    def search_torrents(self, query: str) -> list[TorrentClientTorrent]:
         if not self.client:
-            return None
+            raise click.ClickException("Could not connect to qBittorrent.")
+
+        normalized_query = query.strip().casefold()
+        torrents = []
+        for torrent in self.client.torrents_info(status_filter="completed"):
+            name = str(torrent.get("name") or "")
+            if normalized_query not in name.casefold():
+                continue
+            save_path = str(torrent.get("save_path") or "")
+            torrents.append(
+                TorrentClientTorrent(
+                    name=name,
+                    hash=str(torrent.get("hash") or ""),
+                    content_path=str(torrent.get("content_path") or os.path.join(save_path, name)),
+                    save_path=save_path,
+                    category=str(torrent.get("category") or ""),
+                )
+            )
+        return sorted(torrents, key=lambda torrent: torrent.name.casefold())
+
+    def add_to_downloader(self, remote_folder, torrent, is_paused, label) -> bool:
+        if not self.client:
+            return False
 
         try:
             click.secho("Adding torrent to qBittorrent...", fg="yellow")
@@ -64,9 +114,10 @@ class QBittorrentClient(TorrentClient):
                 torrent_files=torrent, save_path=remote_folder, is_paused=is_paused, category=label
             )
             click.secho("Torrent added successfully", fg="green")
+            return True
         except Exception as e:
             click.secho(f"Failed to add torrent: {e}", fg="red", bold=True)
-            return
+            return False
 
 
 class TransmissionClient(TorrentClient):
@@ -230,16 +281,8 @@ class TorrentClientGenerator:
         Returns:
             An instance of the appropriate TorrentClient subclass.
         """
-        # Sanitize URL for logging to avoid leaking credentials
         parsed = urlparse(url)
-        if parsed.username or parsed.password:
-            safe_netloc = f"****:****@{parsed.hostname}"
-            if parsed.port:
-                safe_netloc += f":{parsed.port}"
-            safe_url = f"{parsed.scheme}://{safe_netloc}{parsed.path}"
-        else:
-            safe_url = url
-        click.secho(f"\nParsing torrent client URL: {safe_url}", fg="cyan")
+        click.secho(f"\nParsing torrent client URL: {_redacted_client_url(url)}", fg="cyan")
 
         username: str | None = None
         password: str | None = None

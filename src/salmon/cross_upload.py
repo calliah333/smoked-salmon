@@ -1,5 +1,6 @@
 import html
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any
@@ -17,6 +18,11 @@ from salmon.constants import ARTIST_IMPORTANCES
 from salmon.converter.downconverting import convert_folder, generate_conversion_description
 from salmon.converter.transcoding import generate_transcode_description, transcode_folder
 from salmon.images import HOSTS
+from salmon.uploader.torrent_client import (
+    QBittorrentClient,
+    TorrentClientGenerator,
+    TorrentClientTorrent,
+)
 from salmon.uploader.upload import compile_files, generate_torrent
 
 if TYPE_CHECKING:
@@ -37,6 +43,25 @@ _RED_IMAGE_URL = re.compile(
     r"https?://redacted\.sh/t/[^\s\[\]\"'<>]+",
     flags=re.IGNORECASE,
 )
+
+
+@dataclass(frozen=True)
+class QBittorrentInput:
+    torrent: TorrentClientTorrent
+    path: Path
+
+
+@dataclass(frozen=True)
+class GeneratedTorrent:
+    torrent_path: str
+    content_path: Path
+
+
+@dataclass(frozen=True)
+class CrossUploadResult:
+    torrent_id: int
+    group_id: int
+    generated_torrents: tuple[GeneratedTorrent, ...]
 
 
 @commandgroup.command()
@@ -81,12 +106,19 @@ async def cross_upload(
 ) -> None:
     """Cross-upload torrents from SOURCE_TRACKER to TARGET_TRACKER.
 
-    INPUT is a source torrent URL/ID, a .torrent file, or a directory of
-    .torrent files. Tracker choices are RED, OPS, and DIC.
+    INPUT is a source torrent URL/ID, a .torrent file, a directory of
+    .torrent files, or a qBittorrent torrent-name search. Name searches use
+    the dedicated cross_seed client running on this server and allow selecting
+    multiple completed torrents. Tracker choices are RED, OPS, and DIC.
+
+    Salmon reads each selected release from the absolute content_path reported
+    by qBittorrent. That path must exist locally; no files are downloaded or
+    copied by this command.
 
     \b
     Examples:
       salmon cross-upload 456 RED OPS --all
+      salmon cross-upload "Artist - Album" RED OPS
       salmon cross-upload 456 RED OPS --target-group-id 123 --transcode 320 --transcode V0
     """
     source, target = source.upper(), target.upper()
@@ -99,41 +131,187 @@ async def cross_upload(
 
     source_site = salmon.trackers.get_class(source)()
     target_site = salmon.trackers.get_class(target)()
-    items = _input_items(torrent_or_directory, source_site)
+    items, qbit = await _resolve_input_items(torrent_or_directory, source_site)
     if target_group_id and len(items) != 1:
         raise click.UsageError("--target-group-id requires a single torrent input, not batch mode.")
     await target_site.ensure_authenticated()
 
     failures = 0
+    target_groups: dict[int, int] = {}
     for item in items:
         try:
             response = await _source_response(item, source_site)
-            torrent_id, group_id = await _upload_response(
+            source_group_id = _source_group_id(response)
+            upload_group_id = target_groups.get(source_group_id) if source_group_id is not None else None
+            result = await _upload_response(
                 response,
                 source_site,
                 target_site,
+                path=item.path if isinstance(item, QBittorrentInput) else None,
+                upload_group_id=upload_group_id,
                 downconvert=downconvert,
                 target_group_id=target_group_id,
                 all_formats=all_formats,
                 transcodes=transcodes,
             )
-            if torrent_id:
+            if source_group_id is not None:
+                target_groups[source_group_id] = result.group_id
+            if isinstance(item, QBittorrentInput):
+                if qbit is None:
+                    raise click.ClickException("qBittorrent input lost its client connection.")
+                _reintroduce_torrents(item, result.generated_torrents, cfg.cross_seed.label, qbit)
+            if result.torrent_id:
                 click.secho(
-                    f"Uploaded: {target_site.base_url}/torrents.php?id={group_id}&torrentid={torrent_id}",
+                    f"Uploaded: {target_site.base_url}/torrents.php?id={result.group_id}&torrentid={result.torrent_id}",
                     fg="green",
                 )
             else:
-                click.secho(f"Uploaded conversions to: {target_site.base_url}/torrents.php?id={group_id}", fg="green")
+                click.secho(
+                    f"Uploaded conversions to: {target_site.base_url}/torrents.php?id={result.group_id}",
+                    fg="green",
+                )
         except Exception as error:
             if len(items) == 1:
                 if isinstance(error, click.ClickException):
                     raise
                 raise click.ClickException(str(error)) from error
             failures += 1
-            click.secho(f"Failed {item}: {error}", fg="red", err=True)
+            click.secho(f"Failed {_item_name(item)}: {error}", fg="red", err=True)
 
     if failures:
         raise click.ClickException(f"{failures} of {len(items)} torrents failed.")
+
+
+async def _resolve_input_items(
+    value: str, source_site: "BaseGazelleApi"
+) -> tuple[list[int | Path | QBittorrentInput], QBittorrentClient | None]:
+    try:
+        items: list[int | Path | QBittorrentInput] = []
+        items.extend(_input_items(value, source_site))
+        return items, None
+    except click.UsageError:
+        if not _is_name_search(value):
+            raise
+
+    client = _configured_qbittorrent()
+    matches = client.search_torrents(value)
+    if not matches:
+        raise click.UsageError(f"No completed qBittorrent torrents match {value!r}.")
+    selected = await _select_qbittorrent_torrents(matches)
+    return [QBittorrentInput(torrent=torrent, path=_local_qbittorrent_path(torrent)) for torrent in selected], client
+
+
+def _is_name_search(value: str) -> bool:
+    stripped = value.strip()
+    return (
+        bool(stripped)
+        and not stripped.isdigit()
+        and not urlparse(stripped).scheme
+        and not any(separator in stripped for separator in ("/", "\\"))
+    )
+
+
+def _cross_seed_client_url() -> str:
+    client_url = cfg.cross_seed.torrent_client.strip()
+    qui_proxy_url = cfg.cross_seed.qui_proxy_url.strip()
+    if client_url and qui_proxy_url:
+        raise click.UsageError("Configure only one of cross_seed.torrent_client or cross_seed.qui_proxy_url.")
+    if qui_proxy_url:
+        parsed = urlparse(qui_proxy_url)
+        proxy_key = parsed.path.rpartition("/proxy/")[2]
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc or not proxy_key or "/" in proxy_key:
+            raise click.UsageError(
+                "cross_seed.qui_proxy_url must be the complete http(s)://host/proxy/client-api-key URL from qui."
+            )
+        return f"qbittorrent+{qui_proxy_url}"
+    if not client_url:
+        raise click.UsageError("Torrent-name searches require cross_seed.torrent_client or cross_seed.qui_proxy_url.")
+    if urlparse(client_url).scheme.split("+", 1)[0] != "qbittorrent":
+        raise click.UsageError("cross_seed.torrent_client must be a qbittorrent+http(s) URL.")
+    return client_url
+
+
+def _configured_qbittorrent() -> QBittorrentClient:
+    client = TorrentClientGenerator.parse_libtc_url(_cross_seed_client_url())
+    if not isinstance(client, QBittorrentClient):
+        raise click.UsageError("The cross-seed client is not configured for qBittorrent.")
+    return client
+
+
+async def _select_qbittorrent_torrents(matches: list[TorrentClientTorrent]) -> list[TorrentClientTorrent]:
+    if len(matches) == 1:
+        click.secho(f"Using qBittorrent torrent: {matches[0].name}", fg="green")
+        return matches
+
+    click.secho("\nCompleted qBittorrent torrents matching the name:", fg="cyan", bold=True)
+    for index, torrent in enumerate(matches, 1):
+        click.echo(f"  {index}. {torrent.name}")
+    if cfg.upload.yes_all:
+        return matches
+
+    while True:
+        selection = await click.prompt(
+            click.style('Select torrents (space-separated IDs, or "*" for all)', fg="magenta"),
+            default="*",
+        )
+        try:
+            indices = _selection_indices(selection, len(matches))
+        except ValueError as error:
+            click.secho(str(error), fg="red")
+            continue
+        return [matches[index - 1] for index in indices]
+
+
+def _selection_indices(value: str, count: int) -> list[int]:
+    if value.strip() == "*":
+        return list(range(1, count + 1))
+    values = value.split()
+    if not values or any(not item.isdigit() for item in values):
+        raise ValueError("Enter space-separated numeric IDs or *.")
+    indices = list(dict.fromkeys(int(item) for item in values))
+    invalid = [index for index in indices if index < 1 or index > count]
+    if invalid:
+        raise ValueError(f"Invalid choices: {invalid}. Enter numbers between 1 and {count}.")
+    return indices
+
+
+def _local_qbittorrent_path(torrent: TorrentClientTorrent) -> Path:
+    path = Path(torrent.content_path).expanduser().resolve()
+    if path.is_dir():
+        return path
+    raise click.ClickException(
+        f"qBittorrent content for {torrent.name!r} was not found at {path}. "
+        "Run salmon on the qBittorrent server with access to the same filesystem."
+    )
+
+
+def _reintroduce_torrents(
+    item: QBittorrentInput,
+    generated_torrents: tuple[GeneratedTorrent, ...],
+    label: str,
+    client: QBittorrentClient,
+) -> None:
+    category = label or item.torrent.category
+
+    for generated in generated_torrents:
+        save_path = str(generated.content_path.resolve().parent)
+        torrent_data = Path(generated.torrent_path).read_bytes()
+        if not client.add_to_downloader(save_path, torrent_data, is_paused=False, label=category):
+            raise click.ClickException(
+                f"Uploaded torrent could not be reintroduced into qBittorrent: {generated.torrent_path}"
+            )
+
+
+def _item_name(item: int | Path | QBittorrentInput) -> str:
+    return item.torrent.name if isinstance(item, QBittorrentInput) else str(item)
+
+
+def _source_group_id(response: dict[str, Any]) -> int | None:
+    value = response.get("group", {}).get("id") or response.get("torrent", {}).get("groupId")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _input_items(value: str, source_site: "BaseGazelleApi") -> list[int | Path]:
@@ -161,9 +339,11 @@ def _torrent_id(value: str, source_site: "BaseGazelleApi") -> int:
     return int(torrent_ids[0])
 
 
-async def _source_response(item: int | Path, source_site: "BaseGazelleApi") -> dict[str, Any]:
+async def _source_response(item: int | Path | QBittorrentInput, source_site: "BaseGazelleApi") -> dict[str, Any]:
     if isinstance(item, int):
         return await source_site.api_call("torrent", params={"id": item})
+    if isinstance(item, QBittorrentInput):
+        return await source_site.api_call("torrent", params={"hash": item.torrent.hash.upper()})
 
     torrent = Torrent.read(item)
     source_host = urlparse(source_site.tracker_url).hostname
@@ -178,20 +358,24 @@ async def _upload_response(
     source_site: "BaseGazelleApi",
     target_site: "BaseGazelleApi",
     *,
+    path: Path | None = None,
+    upload_group_id: int | None = None,
     downconvert: bool = False,
     target_group_id: int | None = None,
     all_formats: bool = False,
     transcodes: tuple[str, ...] = (),
-) -> tuple[int, int]:
+) -> CrossUploadResult:
     source_torrent = response["torrent"]
     downconvert, transcodes = _conversion_options(source_torrent, downconvert, transcodes, all_formats)
 
-    path = _release_path(response)
+    path = path or _release_path(response)
     data = _compile_data(response, source_site, target_site)
     if target_group_id:
+        if upload_group_id:
+            raise click.UsageError("Cannot upload a selected torrent and conversions to two target groups.")
         if not downconvert and not transcodes:
             raise click.UsageError("--target-group-id requires --all, --downconvert, or --transcode.")
-        await _upload_conversions(
+        generated_torrents = await _upload_conversions(
             path,
             data,
             target_site,
@@ -201,26 +385,51 @@ async def _upload_response(
             downconvert,
             transcodes,
         )
-        return 0, target_group_id
+        return CrossUploadResult(0, target_group_id, generated_torrents)
+
+    if upload_group_id:
+        data = _existing_group_data(data, upload_group_id)
     data = await _rehost_red_images(data, source_site)
     torrent_path, torrent = generate_torrent(target_site, str(path))
     files = await compile_files(str(path), torrent, {"source": source_torrent["media"]})
     click.secho(f"Uploading {path.name} using {torrent_path}...", fg="yellow")
     torrent_id, group_id = await target_site.upload(data, files)
 
+    generated_torrents = [GeneratedTorrent(torrent_path, path)]
     if downconvert or transcodes:
         original_url = f"{target_site.base_url}/torrents.php?id={group_id}&torrentid={torrent_id}"
-        await _upload_conversions(
-            path,
-            data,
-            target_site,
-            group_id,
-            original_url,
-            source_torrent["media"],
-            downconvert,
-            transcodes,
+        generated_torrents.extend(
+            await _upload_conversions(
+                path,
+                data,
+                target_site,
+                group_id,
+                original_url,
+                source_torrent["media"],
+                downconvert,
+                transcodes,
+            )
         )
-    return torrent_id, group_id
+    return CrossUploadResult(torrent_id, group_id, tuple(generated_torrents))
+
+
+def _existing_group_data(data: dict[str, Any], group_id: int) -> dict[str, Any]:
+    group_fields = {
+        "title",
+        "artists[]",
+        "importance[]",
+        "year",
+        "record_label",
+        "catalogue_number",
+        "releasetype",
+        "tags",
+        "image",
+        "album_desc",
+    }
+    return {
+        **{key: value for key, value in data.items() if key not in group_fields},
+        "groupid": group_id,
+    }
 
 
 def _conversion_options(
@@ -300,7 +509,7 @@ async def _upload_conversions(
     media: str,
     downconvert: bool,
     transcodes: tuple[str, ...],
-) -> None:
+) -> tuple[GeneratedTorrent, ...]:
     downconvert, transcodes = await _missing_conversions(
         target_site,
         group_id,
@@ -310,22 +519,9 @@ async def _upload_conversions(
     )
     if not downconvert and not transcodes:
         click.secho("All requested conversions already exist in the target group.", fg="yellow")
-        return
+        return ()
 
-    group_fields = {
-        "title",
-        "artists[]",
-        "importance[]",
-        "year",
-        "record_label",
-        "catalogue_number",
-        "releasetype",
-        "tags",
-        "image",
-        "album_desc",
-    }
-    base_data = {key: value for key, value in original_data.items() if key not in group_fields}
-    base_data["groupid"] = group_id
+    base_data = _existing_group_data(original_data, group_id)
 
     variants: list[tuple[str, str, dict[str, Any]]] = []
     if downconvert:
@@ -359,12 +555,15 @@ async def _upload_conversions(
             )
         )
 
+    generated_torrents = []
     for label, variant_path, data in variants:
         torrent_path, torrent = generate_torrent(target_site, variant_path)
         files = await compile_files(variant_path, torrent, {"source": media})
         click.secho(f"Uploading {label} using {torrent_path}...", fg="yellow")
         torrent_id, _ = await target_site.upload(data, files)
         click.secho(f"Uploaded {label}: {target_site.base_url}/torrents.php?torrentid={torrent_id}", fg="green")
+        generated_torrents.append(GeneratedTorrent(torrent_path, Path(variant_path)))
+    return tuple(generated_torrents)
 
 
 async def _rehost_red_images(data: dict[str, Any], source_site: "BaseGazelleApi") -> dict[str, Any]:

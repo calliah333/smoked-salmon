@@ -1,3 +1,4 @@
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -5,14 +6,26 @@ import anyio
 from torf import Torrent
 
 import salmon.cross_upload as cross_upload_module
+import salmon.uploader.torrent_client as torrent_client_module
 from salmon.common import UploadFiles
 from salmon.cross_upload import (
+    GeneratedTorrent,
+    QBittorrentInput,
     _compile_data,
     _conversion_options,
+    _cross_seed_client_url,
     _input_items,
+    _local_qbittorrent_path,
     _missing_conversions,
+    _reintroduce_torrents,
+    _select_qbittorrent_torrents,
     _source_response,
     _upload_conversions,
+)
+from salmon.uploader.torrent_client import (
+    QBittorrentClient,
+    TorrentClientGenerator,
+    TorrentClientTorrent,
 )
 
 
@@ -46,6 +59,103 @@ def test_single_and_batch_inputs(tmp_path: Path) -> None:
     assert _input_items(str(tmp_path), source) == [torrent_file]
     assert anyio.run(_source_response, torrent_file, source) == {"torrent": {"id": 42}}
     assert source.params == ("torrent", {"hash": torrent.infohash.upper()})
+
+
+def test_qbittorrent_name_selection_uses_server_content_path(tmp_path: Path, monkeypatch) -> None:
+    first_path = tmp_path / "Artist - Album [FLAC]"
+    second_path = tmp_path / "Artist - Album [MP3 320]"
+    second_path.mkdir()
+    first = TorrentClientTorrent(
+        name=first_path.name,
+        hash="abc",
+        content_path=str(first_path),
+        save_path=str(tmp_path),
+        category="music",
+    )
+    second = TorrentClientTorrent(
+        name=second_path.name,
+        hash="def",
+        content_path=str(second_path),
+        save_path=str(tmp_path),
+        category="music",
+    )
+    responses = iter(("bad", "2"))
+
+    async def fake_prompt(*_args, **_kwargs):
+        return next(responses)
+
+    messages = []
+    monkeypatch.setattr(cross_upload_module.click, "prompt", fake_prompt)
+    monkeypatch.setattr(cross_upload_module.click, "secho", lambda message, **_kwargs: messages.append(message))
+
+    selected = anyio.run(_select_qbittorrent_torrents, [first, second])
+
+    assert selected == [second]
+    assert any("numeric IDs" in message for message in messages)
+    assert _local_qbittorrent_path(second) == second_path
+
+
+def test_qbittorrent_search_returns_completed_name_matches() -> None:
+    calls = []
+
+    class Api:
+        def torrents_info(self, **kwargs):
+            calls.append(kwargs)
+            return [
+                {
+                    "name": "Other release",
+                    "hash": "000",
+                    "content_path": "/downloads/Other release",
+                    "save_path": "/downloads",
+                },
+                {
+                    "name": "Artist - Album [FLAC]",
+                    "hash": "ABC",
+                    "content_path": "/downloads/Artist - Album [FLAC]",
+                    "save_path": "/downloads",
+                    "category": "music",
+                },
+            ]
+
+    client = object.__new__(QBittorrentClient)
+    client.client = Api()
+
+    assert client.search_torrents("artist - album") == [
+        TorrentClientTorrent(
+            name="Artist - Album [FLAC]",
+            hash="ABC",
+            content_path="/downloads/Artist - Album [FLAC]",
+            save_path="/downloads",
+            category="music",
+        )
+    ]
+    assert calls == [{"status_filter": "completed"}]
+
+
+def test_qui_proxy_url_is_used_as_qbittorrent_api_base(monkeypatch) -> None:
+    proxy_url = "http://127.0.0.1:7476/proxy/client-api-key"
+    client_args = []
+    messages = []
+
+    class Api:
+        def __init__(self, **kwargs):
+            client_args.append(kwargs)
+
+        def auth_log_in(self):
+            pass
+
+    monkeypatch.setattr(cross_upload_module.cfg.cross_seed, "torrent_client", "")
+    monkeypatch.setattr(cross_upload_module.cfg.cross_seed, "qui_proxy_url", proxy_url)
+    monkeypatch.setattr(torrent_client_module.qbittorrentapi, "Client", Api)
+    monkeypatch.setattr(torrent_client_module.click, "secho", lambda message, **_kwargs: messages.append(message))
+
+    assert _cross_seed_client_url() == f"qbittorrent+{proxy_url}"
+    client = TorrentClientGenerator.parse_libtc_url(_cross_seed_client_url())
+
+    assert isinstance(client, QBittorrentClient)
+    assert client_args == [{"host": proxy_url, "username": None, "password": None}]
+    assert all("client-api-key" not in message for message in messages)
+    assert any("/proxy/****" in message for message in messages)
 
 
 def test_cross_upload_data_maps_source_to_target() -> None:
@@ -188,6 +298,7 @@ def test_existing_group_skips_duplicate_original(tmp_path: Path, monkeypatch) ->
 
     async def fake_upload_conversions(*args):
         conversion_calls.append(args)
+        return ()
 
     class Target:
         base_url = "https://orpheus.network"
@@ -208,9 +319,148 @@ def test_existing_group_skips_duplicate_original(tmp_path: Path, monkeypatch) ->
             transcodes=("320", "V0"),
         )
 
-    assert anyio.run(run) == (0, 9)
+    result = anyio.run(run)
+    assert (result.torrent_id, result.group_id, result.generated_torrents) == (0, 9, ())
     assert len(conversion_calls) == 1
     assert conversion_calls[0][3] == 9
+
+
+def test_selected_variant_upload_joins_existing_target_group(tmp_path: Path, monkeypatch) -> None:
+    uploads = []
+    torrent_path = tmp_path / "target.torrent"
+    torrent_path.write_bytes(b"torrent")
+
+    class Target:
+        async def upload(self, data, _files):
+            uploads.append(data)
+            return 101, 9
+
+    async def fake_compile_files(*_args):
+        return UploadFiles(torrent_data=b"torrent")
+
+    monkeypatch.setattr(
+        cross_upload_module,
+        "_compile_data",
+        lambda *_args: {
+            "title": "Album",
+            "artists[]": ["Artist"],
+            "year": 2020,
+            "releasetype": 1,
+            "format": "MP3",
+            "bitrate": "320",
+            "media": "WEB",
+            "release_desc": "description",
+        },
+    )
+    monkeypatch.setattr(cross_upload_module, "_rehost_red_images", lambda data, _site: _async_value(data))
+    monkeypatch.setattr(cross_upload_module, "generate_torrent", lambda *_args: (str(torrent_path), object()))
+    monkeypatch.setattr(cross_upload_module, "compile_files", fake_compile_files)
+
+    result = anyio.run(
+        partial(
+            cross_upload_module._upload_response,
+            {"torrent": {"format": "MP3", "encoding": "320", "media": "WEB"}},
+            SourceSite(),
+            Target(),
+            path=tmp_path,
+            upload_group_id=9,
+        )
+    )
+
+    assert uploads[0]["groupid"] == 9
+    assert "title" not in uploads[0]
+    assert result.generated_torrents == (GeneratedTorrent(str(torrent_path), tmp_path),)
+
+
+def test_batch_variants_reuse_first_target_group(monkeypatch) -> None:
+    responses = [
+        {"group": {"id": 7}, "torrent": {"id": 1}},
+        {"group": {"id": 7}, "torrent": {"id": 2}},
+    ]
+    upload_group_ids = []
+
+    class Site:
+        base_url = "https://tracker.example"
+
+        async def ensure_authenticated(self):
+            pass
+
+    async def fake_resolve(*_args):
+        return [1, 2], None
+
+    async def fake_source_response(*_args):
+        return responses.pop(0)
+
+    async def fake_upload_response(*_args, **kwargs):
+        upload_group_ids.append(kwargs["upload_group_id"])
+        return cross_upload_module.CrossUploadResult(100, 99, ())
+
+    monkeypatch.setattr(cross_upload_module.salmon.trackers, "tracker_list", ["RED", "OPS"])
+    monkeypatch.setattr(cross_upload_module.salmon.trackers, "get_class", lambda _code: Site)
+    monkeypatch.setattr(cross_upload_module, "_resolve_input_items", fake_resolve)
+    monkeypatch.setattr(cross_upload_module, "_source_response", fake_source_response)
+    monkeypatch.setattr(cross_upload_module, "_upload_response", fake_upload_response)
+
+    anyio.run(
+        partial(
+            cross_upload_module.cross_upload.callback,
+            "Album",
+            "RED",
+            "OPS",
+            False,
+            None,
+            False,
+            (),
+        )
+    )
+
+    assert upload_group_ids == [None, 99]
+
+
+def test_generated_torrents_are_reintroduced_beside_server_content(tmp_path: Path) -> None:
+    source_path = tmp_path / "library" / "Artist - Album [FLAC]"
+    variant_path = tmp_path / "library" / "Artist - Album [MP3 320]"
+    source_path.mkdir(parents=True)
+    variant_path.mkdir()
+    original_torrent = tmp_path / "original.torrent"
+    variant_torrent = tmp_path / "variant.torrent"
+    original_torrent.write_bytes(b"original")
+    variant_torrent.write_bytes(b"variant")
+    item = QBittorrentInput(
+        torrent=TorrentClientTorrent(
+            name=source_path.name,
+            hash="ABC",
+            content_path=str(source_path),
+            save_path=str(source_path.parent),
+            category="source-category",
+        ),
+        path=source_path,
+    )
+    calls = []
+
+    class Client:
+        def add_to_downloader(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return True
+
+    _reintroduce_torrents(
+        item,
+        (
+            GeneratedTorrent(str(original_torrent), source_path),
+            GeneratedTorrent(str(variant_torrent), variant_path),
+        ),
+        "cross-seed",
+        Client(),
+    )
+
+    assert calls == [
+        ((str(source_path.parent), b"original"), {"is_paused": False, "label": "cross-seed"}),
+        ((str(variant_path.parent), b"variant"), {"is_paused": False, "label": "cross-seed"}),
+    ]
+
+
+async def _async_value(value):
+    return value
 
 
 def test_existing_conversions_are_filtered_before_processing() -> None:

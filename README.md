@@ -285,6 +285,45 @@ To start an upload (with the WEB source):
 salmon up /data/path/to/album -s WEB
 ```
 
+To cross-upload completed torrents from qBittorrent by name, run salmon on the qBittorrent
+server and configure its local Web API:
+```toml
+[cross_seed]
+torrent_client = "qbittorrent+http://username:password@127.0.0.1:8080"
+label = "cross-seed" # Optional qBittorrent category for generated target torrents
+```
+
+Alternatively, create a client API key in
+[qui's Client Proxy settings](https://getqui.com/docs/features/reverse-proxy#1-create-a-client-api-key)
+and paste the complete generated proxy URL:
+```toml
+[cross_seed]
+qui_proxy_url = "http://127.0.0.1:7476/proxy/client-api-key"
+label = "cross-seed"
+```
+
+The API key is carried in the proxy URL and is redacted from Salmon's connection logs.
+Configure either `torrent_client` or `qui_proxy_url`, not both.
+
+Then use the torrent name as `INPUT`:
+```bash
+salmon cross-upload "Artist - Album" RED OPS
+```
+
+If several completed torrents match, salmon prompts for a space-separated selection or `*`.
+Selected formats from the same source group are uploaded into one target group. Each generated
+target torrent is added back to qBittorrent beside its existing content. No files are transferred.
+
+Salmon does require filesystem access to each absolute `content_path` returned by qBittorrent.
+There is deliberately no release-directory option under `[cross_seed]`: qBittorrent supplies the
+authoritative path for every selected torrent. When Salmon runs directly on the host, grant its
+user read access to those paths. When Salmon runs in a container, mount the torrent storage at the
+same absolute path qBittorrent reports. For example, if qBittorrent reports
+`/srv/torrents/Artist - Album`, Salmon must also see that release at
+`/srv/torrents/Artist - Album`. Creating new downconversions or transcodes additionally requires
+write access to the release's parent directory. Generated `.torrent` files are written under the
+target tracker's configured `dottorrents_dir`.
+
 You can get help directly from the CLI by appending --help to any command. This is especially useful for the up command which has a lot of possible options.
 
 ### 🌐 Spectral Web Interface
