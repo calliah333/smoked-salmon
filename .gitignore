@@ -15,6 +15,7 @@ __pycache__
 temp/
 dist/
 build/
+result
 
 test.py
 smoked.db*
