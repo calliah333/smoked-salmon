@@ -325,9 +325,17 @@ Then use the torrent name as `INPUT`:
 salmon cross-upload "Artist - Album" RED OPS
 ```
 
+To upload only—without adding anything to qBittorrent or placing a `.torrent` file in
+`dottorrents_dir`—use:
+```bash
+salmon cross-upload "Artist - Album" RED OPS --no-inject
+```
+
+In this mode, Salmon generates the torrent in memory and sends its bytes only to the target tracker.
+
 If several completed torrents match, salmon prompts for a space-separated selection or `*`.
-Selected formats from the same source group are uploaded into one target group. Each generated
-target torrent is added back to qBittorrent beside its existing content. No files are transferred.
+Selected formats from the same source group are uploaded into one target group. By default, each
+generated target torrent is added back to qBittorrent beside its existing content. No files are transferred.
 
 Salmon does require filesystem access to each absolute `content_path` returned by qBittorrent.
 There is deliberately no release-directory option under `[cross_seed]`: qBittorrent supplies the
@@ -337,7 +345,7 @@ same absolute path qBittorrent reports. For example, if qBittorrent reports
 `/srv/torrents/Artist - Album`, Salmon must also see that release at
 `/srv/torrents/Artist - Album`. Creating new downconversions or transcodes additionally requires
 write access to the release's parent directory. Generated `.torrent` files are written under the
-target tracker's configured `dottorrents_dir`.
+target tracker's configured `dottorrents_dir`, except in `--no-inject` mode.
 
 You can get help directly from the CLI by appending --help to any command. This is especially useful for the up command which has a lot of possible options.
 
