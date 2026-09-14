@@ -339,6 +339,12 @@ def test_selected_variant_upload_joins_existing_target_group(tmp_path: Path, mon
             uploads.append(data)
             return 101, 9
 
+        async def torrentgroup(self, _group_id):
+            return {
+                "group": {"year": 2020, "recordLabel": "", "catalogueNumber": ""},
+                "torrents": [],
+            }
+
     async def fake_compile_files(*_args):
         return UploadFiles(torrent_data=b"torrent")
 
@@ -354,6 +360,7 @@ def test_selected_variant_upload_joins_existing_target_group(tmp_path: Path, mon
             "bitrate": "320",
             "media": "WEB",
             "release_desc": "description",
+            "album_desc": "Source album description",
         },
     )
     monkeypatch.setattr(cross_upload_module, "_rehost_red_images", lambda data, _site: _async_value(data))
@@ -377,7 +384,129 @@ def test_selected_variant_upload_joins_existing_target_group(tmp_path: Path, mon
 
     assert uploads[0]["groupid"] == 9
     assert "title" not in uploads[0]
+    assert uploads[0]["album_desc"] == "Source album description"
     assert result.generated_torrents == (GeneratedTorrent(str(torrent_path), tmp_path),)
+
+
+def test_preexisting_target_torrent_is_skipped_before_upload(tmp_path: Path, monkeypatch) -> None:
+    data = {
+        "title": "Album",
+        "artists[]": ["Artist"],
+        "importance[]": [1],
+        "year": 2020,
+        "record_label": "Label",
+        "catalogue_number": "CAT-1",
+        "releasetype": 1,
+        "format": "MP3",
+        "bitrate": "320",
+        "media": "WEB",
+    }
+
+    class Target:
+        base_url = "https://orpheus.network"
+
+        async def torrentgroup(self, group_id):
+            assert group_id == 9
+            return {
+                "group": {
+                    "name": "Album",
+                    "year": 2020,
+                    "recordLabel": "Label",
+                    "catalogueNumber": "CAT-1",
+                    "musicInfo": {"artists": [{"name": "Artist"}]},
+                },
+                "torrents": [
+                    {
+                        "media": "WEB",
+                        "format": "MP3",
+                        "encoding": "320",
+                        "remasterYear": 2020,
+                    }
+                ],
+            }
+
+        async def upload(self, *_args):
+            raise AssertionError("duplicate torrent must not be uploaded")
+
+    async def fake_search(_site, searchstrs):
+        assert searchstrs == ["artist album"]
+        return [{"groupId": 9}]
+
+    async def fail_group_prompt(*_args, **_kwargs):
+        raise AssertionError("an exact duplicate must be skipped without prompting")
+
+    monkeypatch.setattr(cross_upload_module, "_compile_data", lambda *_args: data)
+    monkeypatch.setattr(cross_upload_module, "get_search_results", fake_search)
+    monkeypatch.setattr(cross_upload_module, "check_existing_group", fail_group_prompt)
+    monkeypatch.setattr(
+        cross_upload_module,
+        "generate_torrent",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("duplicate torrent must not be generated")),
+    )
+
+    result = anyio.run(
+        partial(
+            cross_upload_module._upload_response,
+            {"torrent": {"format": "MP3", "encoding": "320", "media": "WEB"}},
+            SourceSite(),
+            Target(),
+            path=tmp_path,
+        )
+    )
+
+    assert result == cross_upload_module.CrossUploadResult(0, 9, (), skipped=True)
+
+
+def test_batch_variant_is_skipped_after_conversion_uploaded_same_format(tmp_path: Path, monkeypatch) -> None:
+    data = {
+        "format": "MP3",
+        "bitrate": "V0 (VBR)",
+        "media": "WEB",
+        "year": 2020,
+        "record_label": "Label",
+        "catalogue_number": "CAT-1",
+    }
+
+    class Target:
+        base_url = "https://orpheus.network"
+
+        async def torrentgroup(self, group_id):
+            assert group_id == 9
+            return {
+                "group": {"year": 2020, "recordLabel": "Label", "catalogueNumber": "CAT-1"},
+                "torrents": [
+                    {
+                        "media": "WEB",
+                        "format": "MP3",
+                        "encoding": "V0 (VBR)",
+                        "remasterYear": 2020,
+                    }
+                ],
+            }
+
+        async def upload(self, *_args):
+            raise AssertionError("duplicate batch variant must not be uploaded")
+
+    monkeypatch.setattr(cross_upload_module, "_compile_data", lambda *_args: data)
+    monkeypatch.setattr(
+        cross_upload_module,
+        "generate_torrent",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("duplicate torrent must not be generated")),
+    )
+
+    result = anyio.run(
+        partial(
+            cross_upload_module._upload_response,
+            {"torrent": {"format": "MP3", "encoding": "V0 (VBR)", "media": "WEB"}},
+            SourceSite(),
+            Target(),
+            path=tmp_path,
+            upload_group_id=9,
+        )
+    )
+
+    assert result.skipped is True
+    assert result.group_id == 9
 
 
 def test_no_inject_uploads_torrent_without_writing_artifact(tmp_path: Path, monkeypatch) -> None:
