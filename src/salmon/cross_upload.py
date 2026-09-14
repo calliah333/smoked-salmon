@@ -65,6 +65,11 @@ class CrossUploadResult:
 
 
 @commandgroup.command()
+@click.option(
+    "--inject/--no-inject",
+    default=True,
+    help="Add target torrents to qBittorrent; --no-inject also avoids writing .torrent files to disk.",
+)
 @click.option("--downconvert", is_flag=True, help="Also upload a 16-bit FLAC downconversion.")
 @click.option(
     "--target-group-id",
@@ -103,6 +108,7 @@ async def cross_upload(
     target_group_id: int | None,
     all_formats: bool,
     transcodes: tuple[str, ...],
+    inject: bool = True,
 ) -> None:
     """Cross-upload torrents from SOURCE_TRACKER to TARGET_TRACKER.
 
@@ -114,6 +120,8 @@ async def cross_upload(
     Salmon reads each selected release from the absolute content_path reported
     by qBittorrent. That path must exist locally; no files are downloaded or
     copied by this command.
+    With --no-inject, generated torrent data is uploaded from memory and no
+    target .torrent files are written or added to qBittorrent.
 
     \b
     Examples:
@@ -153,10 +161,11 @@ async def cross_upload(
                 target_group_id=target_group_id,
                 all_formats=all_formats,
                 transcodes=transcodes,
+                inject=inject,
             )
             if source_group_id is not None:
                 target_groups[source_group_id] = result.group_id
-            if isinstance(item, QBittorrentInput):
+            if inject and isinstance(item, QBittorrentInput):
                 if qbit is None:
                     raise click.ClickException("qBittorrent input lost its client connection.")
                 _reintroduce_torrents(item, result.generated_torrents, cfg.cross_seed.label, qbit)
@@ -364,6 +373,7 @@ async def _upload_response(
     target_group_id: int | None = None,
     all_formats: bool = False,
     transcodes: tuple[str, ...] = (),
+    inject: bool = True,
 ) -> CrossUploadResult:
     source_torrent = response["torrent"]
     downconvert, transcodes = _conversion_options(source_torrent, downconvert, transcodes, all_formats)
@@ -384,18 +394,20 @@ async def _upload_response(
             source_torrent["media"],
             downconvert,
             transcodes,
+            inject,
         )
         return CrossUploadResult(0, target_group_id, generated_torrents)
 
     if upload_group_id:
         data = _existing_group_data(data, upload_group_id)
     data = await _rehost_red_images(data, source_site)
-    torrent_path, torrent = generate_torrent(target_site, str(path))
+    torrent_path, torrent = generate_torrent(target_site, str(path), write=inject)
     files = await compile_files(str(path), torrent, {"source": source_torrent["media"]})
-    click.secho(f"Uploading {path.name} using {torrent_path}...", fg="yellow")
+    torrent_source = torrent_path or "an in-memory torrent"
+    click.secho(f"Uploading {path.name} using {torrent_source}...", fg="yellow")
     torrent_id, group_id = await target_site.upload(data, files)
 
-    generated_torrents = [GeneratedTorrent(torrent_path, path)]
+    generated_torrents = [GeneratedTorrent(torrent_path, path)] if torrent_path else []
     if downconvert or transcodes:
         original_url = f"{target_site.base_url}/torrents.php?id={group_id}&torrentid={torrent_id}"
         generated_torrents.extend(
@@ -408,6 +420,7 @@ async def _upload_response(
                 source_torrent["media"],
                 downconvert,
                 transcodes,
+                inject,
             )
         )
     return CrossUploadResult(torrent_id, group_id, tuple(generated_torrents))
@@ -509,6 +522,7 @@ async def _upload_conversions(
     media: str,
     downconvert: bool,
     transcodes: tuple[str, ...],
+    inject: bool = True,
 ) -> tuple[GeneratedTorrent, ...]:
     downconvert, transcodes = await _missing_conversions(
         target_site,
@@ -557,12 +571,14 @@ async def _upload_conversions(
 
     generated_torrents = []
     for label, variant_path, data in variants:
-        torrent_path, torrent = generate_torrent(target_site, variant_path)
+        torrent_path, torrent = generate_torrent(target_site, variant_path, write=inject)
         files = await compile_files(variant_path, torrent, {"source": media})
-        click.secho(f"Uploading {label} using {torrent_path}...", fg="yellow")
+        torrent_source = torrent_path or "an in-memory torrent"
+        click.secho(f"Uploading {label} using {torrent_source}...", fg="yellow")
         torrent_id, _ = await target_site.upload(data, files)
         click.secho(f"Uploaded {label}: {target_site.base_url}/torrents.php?torrentid={torrent_id}", fg="green")
-        generated_torrents.append(GeneratedTorrent(torrent_path, Path(variant_path)))
+        if torrent_path:
+            generated_torrents.append(GeneratedTorrent(torrent_path, Path(variant_path)))
     return tuple(generated_torrents)
 
 

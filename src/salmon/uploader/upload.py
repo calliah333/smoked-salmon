@@ -1,6 +1,6 @@
 import os
 import re
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 import anyio
 import asyncclick as click
@@ -281,31 +281,50 @@ def generate_catno(metadata: dict[str, Any]) -> str:
     return ""
 
 
-def generate_torrent(gazelle_site: "BaseGazelleApi", path: str) -> tuple[str, Torrent]:
-    """Generate torrent file for the album.
+@overload
+def generate_torrent(
+    gazelle_site: "BaseGazelleApi", path: str, *, write: Literal[True] = True
+) -> tuple[str, Torrent]: ...
+
+
+@overload
+def generate_torrent(gazelle_site: "BaseGazelleApi", path: str, *, write: Literal[False]) -> tuple[None, Torrent]: ...
+
+
+@overload
+def generate_torrent(gazelle_site: "BaseGazelleApi", path: str, *, write: bool) -> tuple[str | None, Torrent]: ...
+
+
+def generate_torrent(gazelle_site: "BaseGazelleApi", path: str, *, write: bool = True) -> tuple[str | None, Torrent]:
+    """Generate a torrent for an album, optionally writing it to disk.
 
     Args:
         gazelle_site: The tracker API instance.
         path: Path to the album folder.
+        write: Persist the torrent under the tracker's dot-torrents directory.
 
     Returns:
-        Tuple of (torrent_path, torrent_object).
+        Tuple of the optional torrent path and generated torrent object.
     """
     click.secho("Generating torrent file...", fg="yellow", nl=False)
-    t = Torrent(
+    torrent = Torrent(
         path,
         trackers=[gazelle_site.announce],
         private=True,
         source=gazelle_site.site_string,
     )
-    t.generate()
-    tpath = os.path.join(
+    torrent.generate()
+    if not write:
+        click.secho(" done in memory!", fg="yellow")
+        return None, torrent
+
+    torrent_path = os.path.join(
         gazelle_site.dot_torrents_dir,
         f"{os.path.basename(path)} - {gazelle_site.site_string}.torrent",
     )
-    t.write(tpath, overwrite=True)
+    torrent.write(torrent_path, overwrite=True)
     click.secho(" done!", fg="yellow")
-    return tpath, t
+    return torrent_path, torrent
 
 
 def generate_description(track_data: dict[str, Any], metadata: dict[str, Any]) -> str:

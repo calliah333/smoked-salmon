@@ -223,7 +223,11 @@ def test_conversion_uploads_share_original_group(tmp_path: Path, monkeypatch) ->
 
     monkeypatch.setattr(cross_upload_module, "convert_folder", fake_convert)
     monkeypatch.setattr(cross_upload_module, "transcode_folder", fake_transcode)
-    monkeypatch.setattr(cross_upload_module, "generate_torrent", lambda _site, path: (f"{path}.torrent", object()))
+    monkeypatch.setattr(
+        cross_upload_module,
+        "generate_torrent",
+        lambda _site, path, **_kwargs: (f"{path}.torrent", object()),
+    )
     monkeypatch.setattr(cross_upload_module, "compile_files", fake_compile_files)
     monkeypatch.setattr(cross_upload_module, "generate_conversion_description", lambda *_args: "16-bit description")
     monkeypatch.setattr(cross_upload_module, "generate_transcode_description", lambda _url, rate: f"{rate} description")
@@ -353,7 +357,11 @@ def test_selected_variant_upload_joins_existing_target_group(tmp_path: Path, mon
         },
     )
     monkeypatch.setattr(cross_upload_module, "_rehost_red_images", lambda data, _site: _async_value(data))
-    monkeypatch.setattr(cross_upload_module, "generate_torrent", lambda *_args: (str(torrent_path), object()))
+    monkeypatch.setattr(
+        cross_upload_module,
+        "generate_torrent",
+        lambda *_args, **_kwargs: (str(torrent_path), object()),
+    )
     monkeypatch.setattr(cross_upload_module, "compile_files", fake_compile_files)
 
     result = anyio.run(
@@ -370,6 +378,103 @@ def test_selected_variant_upload_joins_existing_target_group(tmp_path: Path, mon
     assert uploads[0]["groupid"] == 9
     assert "title" not in uploads[0]
     assert result.generated_torrents == (GeneratedTorrent(str(torrent_path), tmp_path),)
+
+
+def test_no_inject_uploads_torrent_without_writing_artifact(tmp_path: Path, monkeypatch) -> None:
+    release_path = tmp_path / "Artist - Album"
+    torrent_directory = tmp_path / "torrents"
+    release_path.mkdir()
+    torrent_directory.mkdir()
+    (release_path / "track.flac").write_bytes(b"audio")
+    uploaded_files = []
+
+    class Target:
+        announce = "https://tracker.example/passkey/announce"
+        base_url = "https://tracker.example"
+        dot_torrents_dir = str(torrent_directory)
+        site_string = "TARGET"
+
+        async def upload(self, _data, files):
+            uploaded_files.append(files)
+            return 101, 9
+
+    monkeypatch.setattr(
+        cross_upload_module,
+        "_compile_data",
+        lambda *_args: {"format": "FLAC", "bitrate": "Lossless", "media": "WEB"},
+    )
+    monkeypatch.setattr(cross_upload_module, "_rehost_red_images", lambda data, _site: _async_value(data))
+
+    result = anyio.run(
+        partial(
+            cross_upload_module._upload_response,
+            {"torrent": {"format": "FLAC", "encoding": "Lossless", "media": "WEB"}},
+            SourceSite(),
+            Target(),
+            path=release_path,
+            inject=False,
+        )
+    )
+
+    assert Torrent.read_stream(uploaded_files[0].torrent_data).name == release_path.name
+    assert list(torrent_directory.iterdir()) == []
+    assert result.generated_torrents == ()
+
+
+def test_no_inject_skips_qbittorrent_handoff(tmp_path: Path, monkeypatch) -> None:
+    source_path = tmp_path / "Artist - Album"
+    source_path.mkdir()
+    item = QBittorrentInput(
+        TorrentClientTorrent(
+            name=source_path.name,
+            hash="ABC",
+            content_path=str(source_path),
+            save_path=str(tmp_path),
+            category="music",
+        ),
+        source_path,
+    )
+
+    class Site:
+        base_url = "https://tracker.example"
+
+        async def ensure_authenticated(self):
+            pass
+
+    async def fake_resolve(*_args):
+        return [item], object()
+
+    async def fake_source_response(*_args):
+        return {"group": {"id": 7}, "torrent": {"id": 1}}
+
+    async def fake_upload_response(*_args, **kwargs):
+        assert kwargs["inject"] is False
+        return cross_upload_module.CrossUploadResult(100, 99, ())
+
+    monkeypatch.setattr(cross_upload_module.salmon.trackers, "tracker_list", ["RED", "OPS"])
+    monkeypatch.setattr(cross_upload_module.salmon.trackers, "get_class", lambda _code: Site)
+    monkeypatch.setattr(cross_upload_module, "_resolve_input_items", fake_resolve)
+    monkeypatch.setattr(cross_upload_module, "_source_response", fake_source_response)
+    monkeypatch.setattr(cross_upload_module, "_upload_response", fake_upload_response)
+    monkeypatch.setattr(
+        cross_upload_module,
+        "_reintroduce_torrents",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("must not inject")),
+    )
+
+    anyio.run(
+        partial(
+            cross_upload_module.cross_upload.callback,
+            "Album",
+            "RED",
+            "OPS",
+            False,
+            None,
+            False,
+            (),
+            inject=False,
+        )
+    )
 
 
 def test_batch_variants_reuse_first_target_group(monkeypatch) -> None:
