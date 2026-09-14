@@ -18,6 +18,11 @@ from salmon.constants import ARTIST_IMPORTANCES
 from salmon.converter.downconverting import convert_folder, generate_conversion_description
 from salmon.converter.transcoding import generate_transcode_description, transcode_folder
 from salmon.images import HOSTS
+from salmon.uploader.dupe_checker import (
+    check_existing_group,
+    generate_dupe_check_searchstrs,
+    get_search_results,
+)
 from salmon.uploader.torrent_client import (
     QBittorrentClient,
     TorrentClientGenerator,
@@ -62,6 +67,7 @@ class CrossUploadResult:
     torrent_id: int
     group_id: int
     generated_torrents: tuple[GeneratedTorrent, ...]
+    skipped: bool = False
 
 
 @commandgroup.command()
@@ -169,16 +175,18 @@ async def cross_upload(
                 if qbit is None:
                     raise click.ClickException("qBittorrent input lost its client connection.")
                 _reintroduce_torrents(item, result.generated_torrents, cfg.cross_seed.label, qbit)
-            if result.torrent_id:
-                click.secho(
-                    f"Uploaded: {target_site.base_url}/torrents.php?id={result.group_id}&torrentid={result.torrent_id}",
-                    fg="green",
-                )
-            else:
-                click.secho(
-                    f"Uploaded conversions to: {target_site.base_url}/torrents.php?id={result.group_id}",
-                    fg="green",
-                )
+            if not result.skipped:
+                if result.torrent_id:
+                    click.secho(
+                        f"Uploaded: {target_site.base_url}/torrents.php?id={result.group_id}"
+                        f"&torrentid={result.torrent_id}",
+                        fg="green",
+                    )
+                else:
+                    click.secho(
+                        f"Uploaded conversions to: {target_site.base_url}/torrents.php?id={result.group_id}",
+                        fg="green",
+                    )
         except Exception as error:
             if len(items) == 1:
                 if isinstance(error, click.ClickException):
@@ -398,7 +406,27 @@ async def _upload_response(
         )
         return CrossUploadResult(0, target_group_id, generated_torrents)
 
+    if not upload_group_id:
+        searchstrs = _target_searchstrs(data)
+        if searchstrs:
+            duplicate_group_id = await _find_duplicate_target_group(target_site, searchstrs, data)
+            if duplicate_group_id:
+                click.secho(
+                    f"Skipping {path.name}: {data['format']} {data['bitrate']} already exists in "
+                    f"{target_site.base_url}/torrents.php?id={duplicate_group_id}.",
+                    fg="yellow",
+                )
+                return CrossUploadResult(0, duplicate_group_id, (), skipped=True)
+            upload_group_id = await check_existing_group(target_site, searchstrs, offer_deletion=False)
     if upload_group_id:
+        target_group = await target_site.torrentgroup(upload_group_id)
+        if _has_variant(target_group, data, data["format"], data["bitrate"]):
+            click.secho(
+                f"Skipping {path.name}: {data['format']} {data['bitrate']} already exists in "
+                f"{target_site.base_url}/torrents.php?id={upload_group_id}.",
+                fg="yellow",
+            )
+            return CrossUploadResult(0, upload_group_id, (), skipped=True)
         data = _existing_group_data(data, upload_group_id)
     data = await _rehost_red_images(data, source_site)
     torrent_path, torrent = generate_torrent(target_site, str(path), write=inject)
@@ -426,6 +454,28 @@ async def _upload_response(
     return CrossUploadResult(torrent_id, group_id, tuple(generated_torrents))
 
 
+def _target_searchstrs(data: dict[str, Any]) -> list[str]:
+    importances = data.get("importance[]", [])
+    artists = [
+        [
+            artist,
+            "main"
+            if index < len(importances) and str(importances[index]) == str(ARTIST_IMPORTANCES["main"])
+            else "guest",
+        ]
+        for index, artist in enumerate(data.get("artists[]", []))
+    ]
+    return [
+        searchstr
+        for searchstr in generate_dupe_check_searchstrs(
+            artists,
+            data.get("title"),
+            data.get("catalogue_number"),
+        )
+        if searchstr.strip()
+    ]
+
+
 def _existing_group_data(data: dict[str, Any], group_id: int) -> dict[str, Any]:
     group_fields = {
         "title",
@@ -437,12 +487,52 @@ def _existing_group_data(data: dict[str, Any], group_id: int) -> dict[str, Any]:
         "releasetype",
         "tags",
         "image",
-        "album_desc",
     }
     return {
         **{key: value for key, value in data.items() if key not in group_fields},
         "groupid": group_id,
     }
+
+
+async def _find_duplicate_target_group(
+    target_site: "BaseGazelleApi",
+    searchstrs: list[str],
+    data: dict[str, Any],
+) -> int | None:
+    for result in await get_search_results(target_site, searchstrs):
+        try:
+            group_id = int(result["groupId"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        target_group = await target_site.torrentgroup(group_id)
+        if _same_group(target_group["group"], data) and _has_variant(
+            target_group,
+            data,
+            data["format"],
+            data["bitrate"],
+        ):
+            return group_id
+    return None
+
+
+def _same_group(group: dict[str, Any], data: dict[str, Any]) -> bool:
+    if _normalized(group.get("name")) != _normalized(data.get("title")):
+        return False
+    if _normalized(group.get("year")) != _normalized(data.get("year")):
+        return False
+
+    importances = data.get("importance[]", [])
+    expected_artists = {
+        _normalized(artist)
+        for index, artist in enumerate(data.get("artists[]", []))
+        if index < len(importances) and str(importances[index]) == str(ARTIST_IMPORTANCES["main"])
+    }
+    actual_artists = {
+        _normalized(artist.get("name"))
+        for artist in group.get("musicInfo", {}).get("artists", [])
+        if artist.get("name")
+    }
+    return not expected_artists or not actual_artists or expected_artists == actual_artists
 
 
 def _conversion_options(
@@ -461,6 +551,37 @@ def _conversion_options(
     return downconvert, transcodes
 
 
+def _has_variant(
+    target_group: dict[str, Any],
+    data: dict[str, Any],
+    format_: str,
+    encoding: str,
+) -> bool:
+    group = target_group["group"]
+    expected = (
+        data["media"],
+        format_,
+        encoding,
+        data.get("remaster_year") or data.get("year"),
+        data.get("remaster_title"),
+        data.get("remaster_record_label") or data.get("record_label"),
+        data.get("remaster_catalogue_number") or data.get("catalogue_number"),
+    )
+    for torrent in target_group["torrents"]:
+        actual = (
+            torrent["media"],
+            torrent["format"],
+            torrent["encoding"],
+            torrent.get("remasterYear") or group.get("year"),
+            torrent.get("remasterTitle"),
+            torrent.get("remasterRecordLabel") or group.get("recordLabel"),
+            torrent.get("remasterCatalogueNumber") or group.get("catalogueNumber"),
+        )
+        if tuple(_normalized(value) for value in actual) == tuple(_normalized(value) for value in expected):
+            return True
+    return False
+
+
 async def _missing_conversions(
     target_site: "BaseGazelleApi",
     group_id: int,
@@ -469,31 +590,9 @@ async def _missing_conversions(
     transcodes: tuple[str, ...],
 ) -> tuple[bool, tuple[str, ...]]:
     target_group = await target_site.torrentgroup(group_id)
-    group = target_group["group"]
 
     def has_variant(format_: str, encoding: str) -> bool:
-        expected = (
-            data["media"],
-            format_,
-            encoding,
-            data.get("remaster_year") or data.get("year"),
-            data.get("remaster_title"),
-            data.get("remaster_record_label") or data.get("record_label"),
-            data.get("remaster_catalogue_number") or data.get("catalogue_number"),
-        )
-        for torrent in target_group["torrents"]:
-            actual = (
-                torrent["media"],
-                torrent["format"],
-                torrent["encoding"],
-                torrent.get("remasterYear") or group.get("year"),
-                torrent.get("remasterTitle"),
-                torrent.get("remasterRecordLabel") or group.get("recordLabel"),
-                torrent.get("remasterCatalogueNumber") or group.get("catalogueNumber"),
-            )
-            if tuple(_normalized(value) for value in actual) == tuple(_normalized(value) for value in expected):
-                return True
-        return False
+        return _has_variant(target_group, data, format_, encoding)
 
     if downconvert and has_variant("FLAC", "Lossless"):
         click.secho("Skipping 16-bit FLAC: it already exists in the target group.", fg="yellow")

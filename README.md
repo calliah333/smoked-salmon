@@ -334,8 +334,11 @@ salmon cross-upload "Artist - Album" RED OPS --no-inject
 In this mode, Salmon generates the torrent in memory and sends its bytes only to the target tracker.
 
 If several completed torrents match, salmon prompts for a space-separated selection or `*`.
-Selected formats from the same source group are uploaded into one target group. By default, each
-generated target torrent is added back to qBittorrent beside its existing content. No files are transferred.
+Before the first upload for each release, salmon searches the target tracker for an existing group.
+An exact media, format, encoding, and edition match is skipped automatically; otherwise salmon lets
+you select the existing target group or create a new one. Selected formats from the same source group
+are then uploaded into that target group. By default, each generated target torrent is added back to
+qBittorrent beside its existing content. No files are transferred.
 
 Salmon does require filesystem access to each absolute `content_path` returned by qBittorrent.
 There is deliberately no release-directory option under `[cross_seed]`: qBittorrent supplies the
