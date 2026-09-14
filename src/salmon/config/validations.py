@@ -164,6 +164,12 @@ class Tracker(BaseStruct):
             raise ValueError("Default tracker is invalid!")
 
 
+class CrossSeed(BaseStruct):
+    torrent_client: str = ""
+    qui_proxy_url: str = ""
+    label: str = ""
+
+
 class Seedbox(BaseStruct):
     name: str = ""
     enabled: bool = False
@@ -351,6 +357,7 @@ class Cfg(BaseStruct):
     metadata: Metadata = msgspec.field(default_factory=Metadata)
     image: ImageUploader = msgspec.field(default_factory=ImageUploader)
     tracker: Tracker = msgspec.field(default_factory=Tracker)
+    cross_seed: CrossSeed = msgspec.field(default_factory=CrossSeed)
     seedbox: list[Seedbox] = msgspec.field(default_factory=list)
     upload: Upload = msgspec.field(default_factory=Upload)
     proxy: ProxyCfg = msgspec.field(default_factory=ProxyCfg)
