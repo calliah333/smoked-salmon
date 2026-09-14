@@ -98,6 +98,21 @@ Installing with pip is not recommended because uv (and pipx) manage python versi
 	uv tool install git+https://github.com/smokin-salmon/smoked-salmon
 	```
 
+#### Nix
+With [flakes enabled](https://nixos.wiki/wiki/Flakes), run smoked-salmon directly from the checkout:
+
+```bash
+nix run . -- --help
+nix run . -- health
+```
+
+The flake packages the locked Python environment together with the command-line tools (`curl`, `flac`, `git`, `lame`, `mp3val`, `sox`, and optional `rclone`). To enter an editable development shell with the locked development dependencies:
+
+```bash
+nix develop
+salmon --help
+```
+
 ### 🔹  Initial Setup
 1. Run salmon for the first time and follow the instructions to create a default configuration:
 	```
