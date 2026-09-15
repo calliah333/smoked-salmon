@@ -95,6 +95,17 @@ class CrossUploadResult:
     multiple=True,
     help="Also upload an MP3 transcode; may be passed more than once.",
 )
+@click.option(
+    "--input",
+    "additional_inputs",
+    multiple=True,
+    help="Additional torrent URL, ID, .torrent path, directory, or qBittorrent name search; repeat as needed.",
+)
+@click.option(
+    "--also-source",
+    is_flag=True,
+    help="Also upload requested downconversions and transcodes to each source tracker group.",
+)
 @click.argument("torrent_or_directory", metavar="INPUT")
 @click.argument(
     "source",
@@ -115,13 +126,16 @@ async def cross_upload(
     all_formats: bool,
     transcodes: tuple[str, ...],
     inject: bool = True,
+    additional_inputs: tuple[str, ...] = (),
+    also_source: bool = False,
 ) -> None:
     """Cross-upload torrents from SOURCE_TRACKER to TARGET_TRACKER.
 
-    INPUT is a source torrent URL/ID, a .torrent file, a directory of
-    .torrent files, or a qBittorrent torrent-name search. Name searches use
-    the dedicated cross_seed client running on this server and allow selecting
-    multiple completed torrents. Tracker choices are RED, OPS, and DIC.
+    INPUT and each repeatable --input value may be a source torrent URL/ID,
+    a .torrent file, a directory of .torrent files, or a qBittorrent
+    torrent-name search. Name searches use the dedicated cross_seed client
+    running on this server and allow selecting multiple completed torrents.
+    Tracker choices are RED, OPS, and DIC.
 
     Salmon reads each selected release from the absolute content_path reported
     by qBittorrent. That path must exist locally; no files are downloaded or
@@ -132,23 +146,26 @@ async def cross_upload(
     \b
     Examples:
       salmon cross-upload 456 RED OPS --all
-      salmon cross-upload "Artist - Album" RED OPS
+      salmon cross-upload "Album A" RED OPS --input "Album B" --all --also-source
       salmon cross-upload 456 RED OPS --target-group-id 123 --transcode 320 --transcode V0
     """
     source, target = source.upper(), target.upper()
+    if also_source and not (downconvert or all_formats or transcodes):
+        raise click.UsageError("--also-source requires --all, --downconvert, or --transcode.")
     if source == target:
         raise click.UsageError("SOURCE and TARGET must be different trackers.")
-
     missing = [code for code in (source, target) if code not in salmon.trackers.tracker_list]
     if missing:
         raise click.UsageError(f"Tracker(s) not configured: {', '.join(missing)}")
 
     source_site = salmon.trackers.get_class(source)()
     target_site = salmon.trackers.get_class(target)()
-    items, qbit = await _resolve_input_items(torrent_or_directory, source_site)
+    items, qbit = await _resolve_input_items((torrent_or_directory, *additional_inputs), source_site)
     if target_group_id and len(items) != 1:
         raise click.UsageError("--target-group-id requires a single torrent input, not batch mode.")
     await target_site.ensure_authenticated()
+    if also_source:
+        await source_site.ensure_authenticated()
 
     failures = 0
     target_groups: dict[int, int] = {}
@@ -171,10 +188,36 @@ async def cross_upload(
             )
             if source_group_id is not None:
                 target_groups[source_group_id] = result.group_id
+            source_generated_torrents: tuple[GeneratedTorrent, ...] = ()
+            if also_source and response["torrent"]["format"] == "FLAC":
+                if source_group_id is None:
+                    raise click.ClickException("Cannot upload source conversions without the source group ID.")
+                source_result = await _upload_response(
+                    response,
+                    source_site,
+                    source_site,
+                    path=item.path if isinstance(item, QBittorrentInput) else None,
+                    target_group_id=source_group_id,
+                    downconvert=downconvert,
+                    all_formats=all_formats,
+                    transcodes=transcodes,
+                    inject=inject,
+                )
+                source_generated_torrents = source_result.generated_torrents
+                click.secho(
+                    f"Processed requested conversions on {source}: "
+                    f"{source_site.base_url}/torrents.php?id={source_group_id}",
+                    fg="green",
+                )
             if inject and isinstance(item, QBittorrentInput):
                 if qbit is None:
                     raise click.ClickException("qBittorrent input lost its client connection.")
-                _reintroduce_torrents(item, result.generated_torrents, cfg.cross_seed.label, qbit)
+                _reintroduce_torrents(
+                    item,
+                    (*result.generated_torrents, *source_generated_torrents),
+                    cfg.cross_seed.label,
+                    qbit,
+                )
             if not result.skipped:
                 if result.torrent_id:
                     click.secho(
@@ -200,22 +243,40 @@ async def cross_upload(
 
 
 async def _resolve_input_items(
-    value: str, source_site: "BaseGazelleApi"
+    values: str | tuple[str, ...],
+    source_site: "BaseGazelleApi",
 ) -> tuple[list[int | Path | QBittorrentInput], QBittorrentClient | None]:
-    try:
-        items: list[int | Path | QBittorrentInput] = []
-        items.extend(_input_items(value, source_site))
-        return items, None
-    except click.UsageError:
-        if not _is_name_search(value):
-            raise
+    values = (values,) if isinstance(values, str) else values
+    items: list[int | Path | QBittorrentInput] = []
+    client: QBittorrentClient | None = None
 
-    client = _configured_qbittorrent()
-    matches = client.search_torrents(value)
-    if not matches:
-        raise click.UsageError(f"No completed qBittorrent torrents match {value!r}.")
-    selected = await _select_qbittorrent_torrents(matches)
-    return [QBittorrentInput(torrent=torrent, path=_local_qbittorrent_path(torrent)) for torrent in selected], client
+    for value in dict.fromkeys(values):
+        try:
+            items.extend(_input_items(value, source_site))
+            continue
+        except click.UsageError:
+            if not _is_name_search(value):
+                raise
+
+        client = client or _configured_qbittorrent()
+        matches = client.search_torrents(value)
+        if not matches:
+            raise click.UsageError(f"No completed qBittorrent torrents match {value!r}.")
+        selected = await _select_qbittorrent_torrents(matches)
+        items.extend(
+            QBittorrentInput(torrent=torrent, path=_local_qbittorrent_path(torrent)) for torrent in selected
+        )
+
+    unique: dict[tuple[str, str], int | Path | QBittorrentInput] = {}
+    for item in items:
+        if isinstance(item, QBittorrentInput):
+            key = ("qbit", item.torrent.hash.upper())
+        elif isinstance(item, Path):
+            key = ("path", str(item.resolve()))
+        else:
+            key = ("id", str(item))
+        unique.setdefault(key, item)
+    return list(unique.values()), client
 
 
 def _is_name_search(value: str) -> bool:
@@ -411,22 +472,30 @@ async def _upload_response(
         if searchstrs:
             duplicate_group_id = await _find_duplicate_target_group(target_site, searchstrs, data)
             if duplicate_group_id:
-                click.secho(
-                    f"Skipping {path.name}: {data['format']} {data['bitrate']} already exists in "
-                    f"{target_site.base_url}/torrents.php?id={duplicate_group_id}.",
-                    fg="yellow",
+                return await _use_existing_target(
+                    path,
+                    data,
+                    target_site,
+                    duplicate_group_id,
+                    source_torrent["media"],
+                    downconvert,
+                    transcodes,
+                    inject,
                 )
-                return CrossUploadResult(0, duplicate_group_id, (), skipped=True)
             upload_group_id = await check_existing_group(target_site, searchstrs, offer_deletion=False)
     if upload_group_id:
         target_group = await target_site.torrentgroup(upload_group_id)
         if _has_variant(target_group, data, data["format"], data["bitrate"]):
-            click.secho(
-                f"Skipping {path.name}: {data['format']} {data['bitrate']} already exists in "
-                f"{target_site.base_url}/torrents.php?id={upload_group_id}.",
-                fg="yellow",
+            return await _use_existing_target(
+                path,
+                data,
+                target_site,
+                upload_group_id,
+                source_torrent["media"],
+                downconvert,
+                transcodes,
+                inject,
             )
-            return CrossUploadResult(0, upload_group_id, (), skipped=True)
         data = _existing_group_data(data, upload_group_id)
     data = await _rehost_red_images(data, source_site)
     torrent_path, torrent = generate_torrent(target_site, str(path), write=inject)
@@ -452,6 +521,38 @@ async def _upload_response(
             )
         )
     return CrossUploadResult(torrent_id, group_id, tuple(generated_torrents))
+
+
+async def _use_existing_target(
+    path: Path,
+    data: dict[str, Any],
+    target_site: "BaseGazelleApi",
+    group_id: int,
+    media: str,
+    downconvert: bool,
+    transcodes: tuple[str, ...],
+    inject: bool,
+) -> CrossUploadResult:
+    click.secho(
+        f"Skipping {path.name}: {data['format']} {data['bitrate']} already exists in "
+        f"{target_site.base_url}/torrents.php?id={group_id}.",
+        fg="yellow",
+    )
+    if not downconvert and not transcodes:
+        return CrossUploadResult(0, group_id, (), skipped=True)
+
+    generated_torrents = await _upload_conversions(
+        path,
+        data,
+        target_site,
+        group_id,
+        f"{target_site.base_url}/torrents.php?id={group_id}",
+        media,
+        downconvert,
+        transcodes,
+        inject,
+    )
+    return CrossUploadResult(0, group_id, generated_torrents)
 
 
 def _target_searchstrs(data: dict[str, Any]) -> list[str]:
