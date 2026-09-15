@@ -19,8 +19,8 @@ from salmon.converter.downconverting import convert_folder, generate_conversion_
 from salmon.converter.transcoding import generate_transcode_description, transcode_folder
 from salmon.images import HOSTS
 from salmon.uploader.dupe_checker import (
-    fetch_existing_group_candidates,
     generate_dupe_check_searchstrs,
+    get_search_results,
     resolve_existing_group,
 )
 from salmon.uploader.torrent_client import (
@@ -71,7 +71,7 @@ class CrossUploadResult:
     skipped: bool = False
 
 
-@commandgroup.command()
+@commandgroup.command("cross")
 @click.option(
     "--inject/--no-inject",
     default=True,
@@ -87,7 +87,7 @@ class CrossUploadResult:
     "--all-formats",
     "--all",
     is_flag=True,
-    help="Upload every possible downconversion and MP3 transcode.",
+    help="From each FLAC, also upload missing MP3 320/V0 and, for 24-bit sources, 16-bit FLAC.",
 )
 @click.option(
     "--transcode",
@@ -146,9 +146,9 @@ async def cross_upload(
 
     \b
     Examples:
-      salmon cross-upload 456 RED OPS --all
-      salmon cross-upload "Album A" RED OPS --input "Album B" --all --also-source
-      salmon cross-upload 456 RED OPS --target-group-id 123 --transcode 320 --transcode V0
+      salmon cross 456 RED OPS --all
+      salmon cross "Album A" RED OPS --input "Album B" --all --also-source
+      salmon cross 456 RED OPS --target-group-id 123 --transcode 320 --transcode V0
     """
     source, target = source.upper(), target.upper()
     if also_source and not (downconvert or all_formats or transcodes):
@@ -485,7 +485,7 @@ async def _upload_response(
                 fg="cyan",
                 nl=False,
             )
-            results, recent_uploads = await fetch_existing_group_candidates(target_site, searchstrs)
+            results = await get_search_results(target_site, searchstrs)
             duplicate_group_id = await _find_duplicate_target_group(target_site, results, data)
             click.secho(" done.", fg="cyan")
             if duplicate_group_id:
@@ -504,8 +504,9 @@ async def _upload_response(
                 target_site,
                 searchstrs,
                 results,
-                recent_uploads,
+                None,
                 offer_deletion=False,
+                check_recent=False,
             )
     if upload_group_id:
         target_group = await target_site.torrentgroup(upload_group_id)

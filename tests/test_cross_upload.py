@@ -43,6 +43,9 @@ class SourceSite:
         return {"torrent": {"id": 42}}
 
 
+def test_cross_command_uses_short_name() -> None:
+    assert cross_upload_module.cross_upload.name == "cross"
+
 def test_single_and_batch_inputs(tmp_path: Path) -> None:
     source = SourceSite()
     assert _input_items("42", source) == [42]
@@ -458,13 +461,13 @@ def test_preexisting_target_torrent_is_skipped_before_upload(tmp_path: Path, mon
 
     async def fake_search(_site, searchstrs):
         assert searchstrs == ["artist album"]
-        return [{"groupId": 9}], None
+        return [{"groupId": 9}]
 
     async def fail_group_prompt(*_args, **_kwargs):
         raise AssertionError("an exact duplicate must be skipped without prompting")
 
     monkeypatch.setattr(cross_upload_module, "_compile_data", lambda *_args: data)
-    monkeypatch.setattr(cross_upload_module, "fetch_existing_group_candidates", fake_search)
+    monkeypatch.setattr(cross_upload_module, "get_search_results", fake_search)
     monkeypatch.setattr(cross_upload_module, "resolve_existing_group", fail_group_prompt)
     monkeypatch.setattr(
         cross_upload_module,
@@ -574,14 +577,14 @@ def test_existing_original_still_uploads_missing_requested_conversions(tmp_path:
             }
 
     async def fake_search(*_args):
-        return [{"groupId": 9}], None
+        return [{"groupId": 9}]
 
     async def fake_upload_conversions(*args):
         conversion_calls.append(args)
         return ()
 
     monkeypatch.setattr(cross_upload_module, "_compile_data", lambda *_args: data)
-    monkeypatch.setattr(cross_upload_module, "fetch_existing_group_candidates", fake_search)
+    monkeypatch.setattr(cross_upload_module, "get_search_results", fake_search)
     monkeypatch.setattr(cross_upload_module, "_upload_conversions", fake_upload_conversions)
 
     result = anyio.run(
@@ -624,9 +627,11 @@ def test_target_duplicate_search_is_reused_and_reports_progress(tmp_path: Path, 
 
     async def fake_search(_site, searchstrs):
         search_calls.append(searchstrs)
-        return search_results, None
+        return search_results
 
-    async def fake_resolve(_site, _searchstrs, results, _recent_uploads, **_kwargs):
+    async def fake_resolve(_site, _searchstrs, results, recent_uploads, **kwargs):
+        assert recent_uploads is None
+        assert kwargs["check_recent"] is False
         prompt_results.append(results)
         return 9
 
@@ -643,7 +648,7 @@ def test_target_duplicate_search_is_reused_and_reports_progress(tmp_path: Path, 
             "media": "WEB",
         },
     )
-    monkeypatch.setattr(cross_upload_module, "fetch_existing_group_candidates", fake_search)
+    monkeypatch.setattr(cross_upload_module, "get_search_results", fake_search)
     monkeypatch.setattr(cross_upload_module, "resolve_existing_group", fake_resolve)
     monkeypatch.setattr(cross_upload_module, "_rehost_red_images", lambda data, _site: _async_value(data))
     monkeypatch.setattr(

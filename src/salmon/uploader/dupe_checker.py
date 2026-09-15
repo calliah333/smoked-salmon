@@ -220,6 +220,8 @@ async def resolve_existing_group(
     results: list[dict],
     recent_uploads: list[tuple] | None,
     offer_deletion: bool = True,
+    *,
+    check_recent: bool = True,
 ) -> int | None:
     """Show the candidates fetch_existing_group_candidates found, and prompt the user for a group.
 
@@ -229,12 +231,12 @@ async def resolve_existing_group(
         results: Search results from fetch_existing_group_candidates.
         recent_uploads: Recent uploads from fetch_existing_group_candidates, or None.
         offer_deletion: Whether to offer folder deletion option.
-        results: Optional search results already fetched by the caller.
+        check_recent: Whether to offer recent upload-log candidates when browse has no results.
 
     Returns:
         Group ID or None for new group.
     """
-    if not results and cfg.upload.requests.check_recent_uploads and can_check_site_log(gazelle_site):
+    if check_recent and not results and cfg.upload.requests.check_recent_uploads and can_check_site_log(gazelle_site):
         group_id = await _prompt_for_recent_upload_results(
             gazelle_site, recent_uploads or [], " / ".join(searchstrs), offer_deletion
         )
