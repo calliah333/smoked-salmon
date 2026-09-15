@@ -352,7 +352,9 @@ Before the first upload for each release, salmon searches the target tracker for
 An exact media, format, encoding, and edition match is skipped automatically; otherwise salmon lets
 you select the existing target group or create a new one. Selected formats from the same source group
 are then uploaded into that target group. By default, each generated target torrent is added back to
-qBittorrent beside its existing content. No files are transferred.
+qBittorrent beside its existing content. Salmon verifies that the torrent root name equals the existing
+content directory name, then submits the torrent bytes with that directory's parent as qBittorrent's
+save path.
 
 Salmon does require filesystem access to each absolute `content_path` returned by qBittorrent.
 There is deliberately no release-directory option under `[cross_seed]`: qBittorrent supplies the
@@ -361,8 +363,10 @@ user read access to those paths. When Salmon runs in a container, mount the torr
 same absolute path qBittorrent reports. For example, if qBittorrent reports
 `/srv/torrents/Artist - Album`, Salmon must also see that release at
 `/srv/torrents/Artist - Album`. Creating new downconversions or transcodes additionally requires
-write access to the release's parent directory. Generated `.torrent` files are written under the
-target tracker's configured `dottorrents_dir`, except in `--no-inject` mode.
+write access to the release's parent directory. For qBittorrent name inputs, generated torrent data
+stays in memory until it is submitted directly to qBittorrent; it is not placed in a potentially
+watched `dottorrents_dir`. URL, ID, and local `.torrent` inputs continue to write generated `.torrent`
+files under the target tracker's configured `dottorrents_dir`, except in `--no-inject` mode.
 
 You can get help directly from the CLI by appending --help to any command. This is especially useful for the up command which has a lot of possible options.
 

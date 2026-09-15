@@ -58,8 +58,9 @@ class QBittorrentInput:
 
 @dataclass(frozen=True)
 class GeneratedTorrent:
-    torrent_path: str
+    torrent_data: bytes
     content_path: Path
+    torrent_name: str
 
 
 @dataclass(frozen=True)
@@ -185,6 +186,7 @@ async def cross_upload(
                 all_formats=all_formats,
                 transcodes=transcodes,
                 inject=inject,
+                persist_torrents=inject and not isinstance(item, QBittorrentInput),
             )
             if source_group_id is not None:
                 target_groups[source_group_id] = result.group_id
@@ -202,6 +204,7 @@ async def cross_upload(
                     all_formats=all_formats,
                     transcodes=transcodes,
                     inject=inject,
+                    persist_torrents=inject and not isinstance(item, QBittorrentInput),
                 )
                 source_generated_torrents = source_result.generated_torrents
                 click.secho(
@@ -372,12 +375,16 @@ def _reintroduce_torrents(
     category = label or item.torrent.category
 
     for generated in generated_torrents:
-        save_path = str(generated.content_path.resolve().parent)
-        torrent_data = Path(generated.torrent_path).read_bytes()
-        if not client.add_to_downloader(save_path, torrent_data, is_paused=False, label=category):
+        content_path = generated.content_path.resolve()
+        if generated.torrent_name != content_path.name:
             raise click.ClickException(
-                f"Uploaded torrent could not be reintroduced into qBittorrent: {generated.torrent_path}"
+                f"Cannot cross-seed {generated.torrent_name!r} at {content_path}: "
+                "the torrent root name does not match the existing content directory."
             )
+        save_path = str(content_path.parent)
+        click.secho(f"Linking {generated.torrent_name} to existing content at {content_path}", fg="cyan")
+        if not client.add_to_downloader(save_path, generated.torrent_data, is_paused=False, label=category):
+            raise click.ClickException(f"Uploaded torrent could not be added to qBittorrent at {content_path}.")
 
 
 def _item_name(item: int | Path | QBittorrentInput) -> str:
@@ -443,6 +450,7 @@ async def _upload_response(
     all_formats: bool = False,
     transcodes: tuple[str, ...] = (),
     inject: bool = True,
+    persist_torrents: bool | None = None,
 ) -> CrossUploadResult:
     source_torrent = response["torrent"]
     downconvert, transcodes = _conversion_options(source_torrent, downconvert, transcodes, all_formats)
@@ -464,13 +472,22 @@ async def _upload_response(
             downconvert,
             transcodes,
             inject,
+            persist_torrents,
         )
         return CrossUploadResult(0, target_group_id, generated_torrents)
 
     if not upload_group_id:
         searchstrs = _target_searchstrs(data)
         if searchstrs:
-            duplicate_group_id = await _find_duplicate_target_group(target_site, searchstrs, data)
+            click.secho(
+                f"Checking {getattr(target_site, 'site_string', target_site.base_url)} "
+                "for existing groups and torrents...",
+                fg="cyan",
+                nl=False,
+            )
+            results = await get_search_results(target_site, searchstrs)
+            duplicate_group_id = await _find_duplicate_target_group(target_site, results, data)
+            click.secho(" done.", fg="cyan")
             if duplicate_group_id:
                 return await _use_existing_target(
                     path,
@@ -481,8 +498,14 @@ async def _upload_response(
                     downconvert,
                     transcodes,
                     inject,
+                    persist_torrents,
                 )
-            upload_group_id = await check_existing_group(target_site, searchstrs, offer_deletion=False)
+            upload_group_id = await check_existing_group(
+                target_site,
+                searchstrs,
+                offer_deletion=False,
+                results=results,
+            )
     if upload_group_id:
         target_group = await target_site.torrentgroup(upload_group_id)
         if _has_variant(target_group, data, data["format"], data["bitrate"]):
@@ -495,16 +518,23 @@ async def _upload_response(
                 downconvert,
                 transcodes,
                 inject,
+                persist_torrents,
             )
         data = _existing_group_data(data, upload_group_id)
     data = await _rehost_red_images(data, source_site)
-    torrent_path, torrent = generate_torrent(target_site, str(path), write=inject)
+    if persist_torrents is None:
+        persist_torrents = inject
+    torrent_path, torrent = generate_torrent(target_site, str(path), write=persist_torrents)
     files = await compile_files(str(path), torrent, {"source": source_torrent["media"]})
     torrent_source = torrent_path or "an in-memory torrent"
     click.secho(f"Uploading {path.name} using {torrent_source}...", fg="yellow")
     torrent_id, group_id = await target_site.upload(data, files)
 
-    generated_torrents = [GeneratedTorrent(torrent_path, path)] if torrent_path else []
+    generated_torrents = (
+        [GeneratedTorrent(files.torrent_data, path, str(torrent.name))]
+        if inject
+        else []
+    )
     if downconvert or transcodes:
         original_url = f"{target_site.base_url}/torrents.php?id={group_id}&torrentid={torrent_id}"
         generated_torrents.extend(
@@ -518,6 +548,7 @@ async def _upload_response(
                 downconvert,
                 transcodes,
                 inject,
+                persist_torrents,
             )
         )
     return CrossUploadResult(torrent_id, group_id, tuple(generated_torrents))
@@ -532,6 +563,7 @@ async def _use_existing_target(
     downconvert: bool,
     transcodes: tuple[str, ...],
     inject: bool,
+    persist_torrents: bool | None,
 ) -> CrossUploadResult:
     click.secho(
         f"Skipping {path.name}: {data['format']} {data['bitrate']} already exists in "
@@ -551,6 +583,7 @@ async def _use_existing_target(
         downconvert,
         transcodes,
         inject,
+        persist_torrents,
     )
     return CrossUploadResult(0, group_id, generated_torrents)
 
@@ -597,10 +630,10 @@ def _existing_group_data(data: dict[str, Any], group_id: int) -> dict[str, Any]:
 
 async def _find_duplicate_target_group(
     target_site: "BaseGazelleApi",
-    searchstrs: list[str],
+    results: list[dict[str, Any]],
     data: dict[str, Any],
 ) -> int | None:
-    for result in await get_search_results(target_site, searchstrs):
+    for result in results:
         try:
             group_id = int(result["groupId"])
         except (KeyError, TypeError, ValueError):
@@ -723,6 +756,7 @@ async def _upload_conversions(
     downconvert: bool,
     transcodes: tuple[str, ...],
     inject: bool = True,
+    persist_torrents: bool | None = None,
 ) -> tuple[GeneratedTorrent, ...]:
     downconvert, transcodes = await _missing_conversions(
         target_site,
@@ -770,15 +804,19 @@ async def _upload_conversions(
         )
 
     generated_torrents = []
+    if persist_torrents is None:
+        persist_torrents = inject
     for label, variant_path, data in variants:
-        torrent_path, torrent = generate_torrent(target_site, variant_path, write=inject)
+        torrent_path, torrent = generate_torrent(target_site, variant_path, write=persist_torrents)
         files = await compile_files(variant_path, torrent, {"source": media})
         torrent_source = torrent_path or "an in-memory torrent"
         click.secho(f"Uploading {label} using {torrent_source}...", fg="yellow")
         torrent_id, _ = await target_site.upload(data, files)
         click.secho(f"Uploaded {label}: {target_site.base_url}/torrents.php?torrentid={torrent_id}", fg="green")
-        if torrent_path:
-            generated_torrents.append(GeneratedTorrent(torrent_path, Path(variant_path)))
+        if inject:
+            generated_torrents.append(
+                GeneratedTorrent(files.torrent_data, Path(variant_path), str(torrent.name))
+            )
     return tuple(generated_torrents)
 
 

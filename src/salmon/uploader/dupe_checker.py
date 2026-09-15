@@ -167,6 +167,8 @@ async def check_existing_group(
     gazelle_site: "BaseGazelleApi",
     searchstrs: list[str],
     offer_deletion: bool = True,
+    *,
+    results: list[dict] | None = None,
 ) -> int | None:
     """Check for existing group and prompt user for selection.
 
@@ -174,13 +176,17 @@ async def check_existing_group(
         gazelle_site: The tracker API instance.
         searchstrs: Search strings for dupe checking.
         offer_deletion: Whether to offer folder deletion option.
+        results: Optional search results already fetched by the caller.
 
     Returns:
         Group ID or None for new group.
     """
-    results = await get_search_results(gazelle_site, searchstrs)
+    if results is None:
+        results = await get_search_results(gazelle_site, searchstrs)
     if not results and cfg.upload.requests.check_recent_uploads:
+        click.secho(f"Checking recent {gazelle_site.site_string} uploads...", fg="cyan", nl=False)
         recent_uploads = await dupe_check_recent_torrents(gazelle_site, searchstrs)
+        click.secho(" done.", fg="cyan")
         group_id = await _prompt_for_recent_upload_results(
             gazelle_site, recent_uploads, " / ".join(searchstrs), offer_deletion
         )
