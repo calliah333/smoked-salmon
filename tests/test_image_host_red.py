@@ -12,14 +12,13 @@ import anyio
 import msgspec
 import pytest
 from aiohttp import web
-from aiolimiter import AsyncLimiter
 
 import salmon.uploader
 from salmon import cfg
 from salmon.config.validations import ImageUploader
 from salmon.errors import ImageUploadFailed
 from salmon.images import red, upload_cover
-from salmon.trackers.base import BaseGazelleApi
+from salmon.trackers.base import BaseGazelleApi, _SlidingWindowRateLimiter
 from salmon.trackers.ops import OpsApi
 from salmon.trackers.red import RedApi
 
@@ -31,13 +30,13 @@ BARE_URL = "https://redacted.sh/i/abc123.jpg"
 QUERY_URL = "https://redacted.sh/i/abc123.jpg?imgauth=deadbeef&size=large"
 
 
-class CountingLimiter(AsyncLimiter):
+class CountingLimiter(_SlidingWindowRateLimiter):
     def __init__(self) -> None:
         super().__init__(100, 1)
         self.acquired = 0
 
-    async def acquire(self, amount: float = 1) -> None:
-        await super().acquire(amount)
+    async def acquire(self) -> None:
+        await super().acquire()
         self.acquired += 1
 
 

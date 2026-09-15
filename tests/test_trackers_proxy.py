@@ -18,7 +18,6 @@ import anyio
 import pytest
 from aiohttp import web
 from aiohttp_socks import ProxyConnector
-from aiolimiter import AsyncLimiter
 from fake_proxy import FakeProxy
 from tenacity import stop_after_attempt, wait_none
 from yarl import URL
@@ -27,7 +26,13 @@ from salmon import cfg
 from salmon import proxy as salmon_proxy
 from salmon.config.validations import ProxyCfg, ProxyServicesCfg
 from salmon.errors import UnknownOutcomeError
-from salmon.trackers.base import _NOT_SENT_ERRORS, BaseGazelleApi, HttpResponse, RetryableError
+from salmon.trackers.base import (
+    _NOT_SENT_ERRORS,
+    BaseGazelleApi,
+    HttpResponse,
+    RetryableError,
+    _SlidingWindowRateLimiter,
+)
 
 PASSWORD = "s3cr3t-proxy-pass"
 AUTH = ("salmon", PASSWORD)
@@ -36,7 +41,7 @@ AUTH = ("salmon", PASSWORD)
 PROXIES = [("socks5", AUTH), ("http", AUTH), ("socks4", None)]
 
 
-class CountingLimiter(AsyncLimiter):
+class CountingLimiter(_SlidingWindowRateLimiter):
     """Counts the requests it lets through, and can run a step before a given one goes out."""
 
     def __init__(self) -> None:
@@ -44,8 +49,8 @@ class CountingLimiter(AsyncLimiter):
         self.acquired = 0
         self.before: dict[int, Callable[[], object]] = {}
 
-    async def acquire(self, amount: float = 1) -> None:
-        await super().acquire(amount)
+    async def acquire(self) -> None:
+        await super().acquire()
         self.acquired += 1
         if step := self.before.get(self.acquired):
             step()

@@ -5,7 +5,8 @@ from pathlib import Path
 import anyio
 import pytest
 from aiohttp import web
-from aiolimiter import AsyncLimiter
+
+from salmon.trackers.base import _SlidingWindowRateLimiter
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import salmon.trackers.base as trackers_base
@@ -21,7 +22,7 @@ class FakeApi(BaseGazelleApi):
         super().__init__()
         # Shadow the 5-per-10s limiter so the tests measure connection reuse, not
         # throttling. Per instance, as each test runs on its own event loop.
-        self._rate_limiter = AsyncLimiter(100, 1)
+        self._rate_limiter = _SlidingWindowRateLimiter(100, 1)
         self._authenticated = True
 
 

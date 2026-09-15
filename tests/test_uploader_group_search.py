@@ -17,12 +17,11 @@ from typing import Any
 import anyio
 import pytest
 from aiohttp import web
-from aiolimiter import AsyncLimiter
 
 import salmon.trackers
 import salmon.uploader
 from salmon.errors import AbortAndDeleteFolder, LoginError, RequestFailedError, UploadError
-from salmon.trackers.base import BaseGazelleApi
+from salmon.trackers.base import BaseGazelleApi, _SlidingWindowRateLimiter
 from salmon.uploader import dupe_checker
 
 GROUP = {
@@ -122,13 +121,13 @@ class FakeApi(BaseGazelleApi):
         self.headers["X-Instance"] = instance
 
 
-class CountingLimiter(AsyncLimiter):
+class CountingLimiter(_SlidingWindowRateLimiter):
     def __init__(self, max_rate: float, time_period: float) -> None:
         super().__init__(max_rate, time_period)
         self.acquired = 0
 
-    async def acquire(self, amount: float = 1) -> None:
-        await super().acquire(amount)
+    async def acquire(self) -> None:
+        await super().acquire()
         self.acquired += 1
 
 
@@ -250,7 +249,7 @@ class Flow:
 
 @pytest.fixture(autouse=True)
 def _fast_limiter(monkeypatch: pytest.MonkeyPatch) -> CountingLimiter:
-    # The shared limiter, at 5 per 0.5 s instead of 5 per 10 s. Class-wide, as in the real code.
+    # The shared limiter, at 5 per rolling 0.5 s instead of 4 per 10 s. Class-wide, as in the real code.
     limiter = CountingLimiter(5, 0.5)
     monkeypatch.setattr(BaseGazelleApi, "_rate_limiter", limiter)
     return limiter
@@ -331,7 +330,7 @@ def test_requests_sent_meanwhile_share_the_rate_limiter_and_the_pool(monkeypatch
     assert sent >= len(REQUESTS_WHEN_A_GROUP_IS_FOUND) + 6
     # Every request went through the one class-wide limiter, the background search's too...
     assert _fast_limiter.acquired == sent
-    # ...so the run took at least as long as that limiter allows: a burst of 5, then 10 a second.
+    # ...so the run took at least as long as that limiter allows: 5 per rolling 0.5 s, so no more than 10 a second.
     assert flow.returned_at - started >= (sent - 5) / 10 - 0.05
     # The upload's own client, background search included, never opened more than its two connections.
     assert len(tracker.peers["upload"]) <= 2

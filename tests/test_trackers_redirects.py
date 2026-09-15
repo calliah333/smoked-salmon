@@ -4,23 +4,24 @@ from pathlib import Path
 import anyio
 import pytest
 from aiohttp import web
-from aiolimiter import AsyncLimiter
+
+from salmon.trackers.base import _SlidingWindowRateLimiter
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from salmon.errors import LoginError, RequestFailedError
 from salmon.trackers.base import BaseGazelleApi
 
 
-class CountingLimiter(AsyncLimiter):
+class CountingLimiter(_SlidingWindowRateLimiter):
     """A limiter loose enough not to slow the tests, which counts the slots taken."""
 
     def __init__(self) -> None:
         super().__init__(100, 1)
         self.slots = 0
 
-    async def acquire(self, amount: float = 1) -> None:
+    async def acquire(self) -> None:
         self.slots += 1
-        await super().acquire(amount)
+        await super().acquire()
 
 
 class FakeApi(BaseGazelleApi):

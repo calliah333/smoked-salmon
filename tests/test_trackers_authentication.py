@@ -13,11 +13,10 @@ from collections.abc import Awaitable, Callable
 import anyio
 import pytest
 from aiohttp import web
-from aiolimiter import AsyncLimiter
 from tenacity import wait_none
 
 from salmon.errors import LoginError
-from salmon.trackers.base import BaseGazelleApi, RetryableError
+from salmon.trackers.base import BaseGazelleApi, RetryableError, _SlidingWindowRateLimiter
 
 
 class FakeApi(BaseGazelleApi):
@@ -29,7 +28,7 @@ class FakeApi(BaseGazelleApi):
         self.base_url = base_url
         super().__init__()
         # Per instance, as each test runs on its own event loop. The client is left fresh, not authenticated.
-        self._rate_limiter = AsyncLimiter(100, 1)
+        self._rate_limiter = _SlidingWindowRateLimiter(100, 1)
 
 
 class FakeTracker:

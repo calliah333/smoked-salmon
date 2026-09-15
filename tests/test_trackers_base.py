@@ -1,22 +1,24 @@
+import time
 from urllib.parse import unquote_plus
 
 import anyio
 from aiohttp import web
-from aiolimiter import AsyncLimiter
 
-from salmon.trackers.base import BaseGazelleApi, _normalize_session_cookie
+from salmon.common import UploadFiles
+from salmon.trackers.base import BaseGazelleApi, _normalize_session_cookie, _SlidingWindowRateLimiter
 
 DECODED_COOKIE = "NYzc/MwZ+4rK:Jcc5R/l9nvCJpY8hI7uKpA=="
 
 
 class FakeApi(BaseGazelleApi):
     site_code = "RED"
+    site_string = "RED"
     cookie = DECODED_COOKIE
 
     def __init__(self, base_url: str) -> None:
         self.base_url = base_url
         super().__init__()
-        self._rate_limiter = AsyncLimiter(100, 1)
+        self._rate_limiter = _SlidingWindowRateLimiter(100, 1)
         self._authenticated = True
 
 
@@ -68,3 +70,37 @@ async def _decoded_cookie_reaches_php_intact() -> None:
 
 def test_decoded_cookie_reaches_php_intact() -> None:
     anyio.run(_decoded_cookie_reaches_php_intact)
+
+
+async def _upload_waits_for_the_rolling_window() -> None:
+    window = 0.2
+    request_starts: list[float] = []
+
+    async def handle_ajax(_request: web.Request) -> web.Response:
+        request_starts.append(time.monotonic())
+        return web.json_response({"status": "success", "response": {"torrentid": 1, "groupid": 2}})
+
+    app = web.Application()
+    app.router.add_route("*", "/ajax.php", handle_ajax)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "127.0.0.1", 0).start()
+    api = FakeApi(f"http://127.0.0.1:{runner.addresses[0][1]}")
+    api.api_key = "api-key"
+    api.authkey = "authkey"
+    api._rate_limiter = _SlidingWindowRateLimiter(4, window)
+    try:
+        for _ in range(4):
+            assert await api.api_call("index") == {"torrentid": 1, "groupid": 2}
+        assert await api.upload({}, UploadFiles(torrent_data=b"torrent")) == (1, 2)
+    finally:
+        await api.close()
+        await runner.cleanup()
+
+    assert len(request_starts) == 5
+    # The upload is the fifth request, so it waits until the first leaves the window.
+    assert request_starts[4] - request_starts[0] >= window * 0.9
+
+
+def test_upload_shares_strict_request_rate_limit() -> None:
+    anyio.run(_upload_waits_for_the_rolling_window)

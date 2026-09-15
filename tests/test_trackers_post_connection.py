@@ -16,17 +16,16 @@ import aiohttp
 import anyio
 import pytest
 from aiohttp import web
-from aiolimiter import AsyncLimiter
 from tenacity import wait_none
 
 from salmon.errors import RequestFailedError, UnknownOutcomeError
-from salmon.trackers.base import BaseGazelleApi, HttpResponse
+from salmon.trackers.base import BaseGazelleApi, HttpResponse, _SlidingWindowRateLimiter
 
 # How long the fake tracker holds a slow answer.
 HOLD = 0.3
 
 
-class CountingLimiter(AsyncLimiter):
+class CountingLimiter(_SlidingWindowRateLimiter):
     """Counts the requests it lets through, and can run a step before a given one goes out."""
 
     def __init__(self) -> None:
@@ -34,8 +33,8 @@ class CountingLimiter(AsyncLimiter):
         self.acquired = 0
         self.before: dict[int, Callable[[], Awaitable[object]]] = {}
 
-    async def acquire(self, amount: float = 1) -> None:
-        await super().acquire(amount)
+    async def acquire(self) -> None:
+        await super().acquire()
         self.acquired += 1
         if step := self.before.get(self.acquired):
             await step()

@@ -1,9 +1,11 @@
 import asyncio
 import re
+from collections import deque
 from collections.abc import AsyncIterator, Collection, Iterator
 from contextlib import asynccontextmanager, contextmanager, suppress
 from contextvars import ContextVar
 from http import HTTPStatus
+from time import monotonic
 from typing import Any, cast
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 
@@ -11,7 +13,6 @@ import aiohttp
 import asyncclick as click
 import msgspec
 from aiohttp import FormData
-from aiolimiter import AsyncLimiter
 from bs4 import BeautifulSoup
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential, wait_random
 from torf import TorfError, Torrent
@@ -207,6 +208,36 @@ class HttpResponse(msgspec.Struct, frozen=True):
     status: int
 
 
+class _SlidingWindowRateLimiter:
+    """Limit request starts within a strict rolling time window."""
+
+    def __init__(self, max_requests: int, period_seconds: float) -> None:
+        self._max_requests = max_requests
+        self._period_seconds = period_seconds
+        self._request_starts: deque[float] = deque()
+
+    async def acquire(self) -> None:
+        """Wait until another request fits inside the rolling window."""
+        while True:
+            # No await between the check and the append, so concurrent waiters cannot overfill the window.
+            now = monotonic()
+            cutoff = now - self._period_seconds
+            while self._request_starts and self._request_starts[0] <= cutoff:
+                self._request_starts.popleft()
+
+            if len(self._request_starts) < self._max_requests:
+                self._request_starts.append(now)
+                return
+
+            await asyncio.sleep(self._request_starts[0] + self._period_seconds - now)
+
+    async def __aenter__(self) -> None:
+        await self.acquire()
+
+    async def __aexit__(self, *_exc_info: object) -> None:
+        return None
+
+
 class BaseGazelleApi:
     """Base API client for Gazelle-based trackers."""
 
@@ -218,8 +249,9 @@ class BaseGazelleApi:
     site_string: str
     api_key: str = ""  # Optional, only for API key upload
 
-    # Rate limiter: 5 requests per 10 seconds (shared across all instances)
-    _rate_limiter = AsyncLimiter(5, 10)
+    # RED and OPS allow five API requests per rolling ten-second window. Use four to leave
+    # headroom for timing and untracked manual requests. Shared across all instances.
+    _rate_limiter = _SlidingWindowRateLimiter(4, 10)
 
     def __init__(self) -> None:
         """Initialize the API client. Subclasses should call this after setting cookie/base_url."""
