@@ -325,6 +325,20 @@ Then use the torrent name as `INPUT`:
 salmon cross-upload "Artist - Album" RED OPS
 ```
 
+To process several albums in one command, repeat `--input`. Add `--also-source` to upload
+the requested conversions to the existing source groups as well as the target tracker:
+```bash
+salmon cross-upload "Artist A - Album A" RED OPS \
+  --input "Artist B - Album B" \
+  --input "Artist C - Album C" \
+  --all --also-source --no-inject
+```
+
+For each RED FLAC selected above, OPS receives the original FLAC and any missing conversions.
+RED receives only the missing conversions in its existing source group. `--all` requests MP3
+320 and V0, plus 16-bit FLAC when the source is 24-bit. Use repeated `--transcode` options
+instead of `--all` when only specific MP3 encodings are wanted.
+
 To upload only—without adding anything to qBittorrent or placing a `.torrent` file in
 `dottorrents_dir`—use:
 ```bash

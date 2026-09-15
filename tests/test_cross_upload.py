@@ -132,6 +132,35 @@ def test_qbittorrent_search_returns_completed_name_matches() -> None:
     assert calls == [{"status_filter": "completed"}]
 
 
+def test_multiple_name_inputs_share_client_and_deduplicate_torrents(tmp_path: Path, monkeypatch) -> None:
+    paths = [tmp_path / "Artist A - Album A", tmp_path / "Artist B - Album B"]
+    for path in paths:
+        path.mkdir()
+    torrents = {
+        "Album A": TorrentClientTorrent("Artist A - Album A", "AAA", str(paths[0]), str(tmp_path), "music"),
+        "Album B": TorrentClientTorrent("Artist B - Album B", "BBB", str(paths[1]), str(tmp_path), "music"),
+    }
+    searches = []
+
+    class Client:
+        def search_torrents(self, query):
+            searches.append(query)
+            return [torrents[query]]
+
+    client = Client()
+    monkeypatch.setattr(cross_upload_module, "_configured_qbittorrent", lambda: client)
+
+    items, resolved_client = anyio.run(
+        cross_upload_module._resolve_input_items,
+        ("Album A", "Album B", "Album A"),
+        SourceSite(),
+    )
+
+    assert [item.torrent.hash for item in items if isinstance(item, QBittorrentInput)] == ["AAA", "BBB"]
+    assert resolved_client is client
+    assert searches == ["Album A", "Album B"]
+
+
 def test_qui_proxy_url_is_used_as_qbittorrent_api_base(monkeypatch) -> None:
     proxy_url = "http://127.0.0.1:7476/proxy/client-api-key"
     client_args = []
@@ -509,6 +538,71 @@ def test_batch_variant_is_skipped_after_conversion_uploaded_same_format(tmp_path
     assert result.group_id == 9
 
 
+def test_existing_original_still_uploads_missing_requested_conversions(tmp_path: Path, monkeypatch) -> None:
+    conversion_calls = []
+    data = {
+        "title": "Album",
+        "artists[]": ["Artist"],
+        "importance[]": [1],
+        "year": 2020,
+        "record_label": "Label",
+        "catalogue_number": "CAT-1",
+        "format": "FLAC",
+        "bitrate": "Lossless",
+        "media": "WEB",
+    }
+
+    class Target:
+        base_url = "https://orpheus.network"
+
+        async def torrentgroup(self, _group_id):
+            return {
+                "group": {
+                    "name": "Album",
+                    "year": 2020,
+                    "recordLabel": "Label",
+                    "catalogueNumber": "CAT-1",
+                    "musicInfo": {"artists": [{"name": "Artist"}]},
+                },
+                "torrents": [
+                    {
+                        "media": "WEB",
+                        "format": "FLAC",
+                        "encoding": "Lossless",
+                        "remasterYear": 2020,
+                    }
+                ],
+            }
+
+    async def fake_search(*_args):
+        return [{"groupId": 9}]
+
+    async def fake_upload_conversions(*args):
+        conversion_calls.append(args)
+        return ()
+
+    monkeypatch.setattr(cross_upload_module, "_compile_data", lambda *_args: data)
+    monkeypatch.setattr(cross_upload_module, "get_search_results", fake_search)
+    monkeypatch.setattr(cross_upload_module, "_upload_conversions", fake_upload_conversions)
+
+    result = anyio.run(
+        partial(
+            cross_upload_module._upload_response,
+            {"torrent": {"format": "FLAC", "encoding": "Lossless", "media": "WEB"}},
+            SourceSite(),
+            Target(),
+            path=tmp_path,
+            transcodes=("320", "V0"),
+            inject=False,
+        )
+    )
+
+    assert len(conversion_calls) == 1
+    assert conversion_calls[0][3] == 9
+    assert conversion_calls[0][7] == ("320", "V0")
+    assert result == cross_upload_module.CrossUploadResult(0, 9, ())
+
+
 def test_no_inject_uploads_torrent_without_writing_artifact(tmp_path: Path, monkeypatch) -> None:
     release_path = tmp_path / "Artist - Album"
     torrent_directory = tmp_path / "torrents"
@@ -649,6 +743,77 @@ def test_batch_variants_reuse_first_target_group(monkeypatch) -> None:
     )
 
     assert upload_group_ids == [None, 99]
+
+
+def test_multiple_albums_upload_conversions_to_target_and_source(monkeypatch) -> None:
+    responses = {
+        1: {"group": {"id": 7}, "torrent": {"id": 1, "format": "FLAC"}},
+        2: {"group": {"id": 8}, "torrent": {"id": 2, "format": "FLAC"}},
+    }
+    calls = []
+    authenticated = []
+
+    class Site:
+        base_url = "https://tracker.example"
+
+        def __init__(self, site_code):
+            self.site_code = site_code
+
+        async def ensure_authenticated(self):
+            authenticated.append(self.site_code)
+
+    source_site = Site("RED")
+    target_site = Site("OPS")
+
+    async def fake_resolve(values, site):
+        assert values == ("Album A", "Album B")
+        assert site is source_site
+        return [1, 2], None
+
+    async def fake_source_response(item, site):
+        assert site is source_site
+        return responses[item]
+
+    async def fake_upload_response(_response, from_site, to_site, **kwargs):
+        calls.append((from_site.site_code, to_site.site_code, kwargs))
+        group_id = kwargs.get("target_group_id") or (90 + len(calls))
+        return cross_upload_module.CrossUploadResult(100, group_id, ())
+
+    monkeypatch.setattr(cross_upload_module.salmon.trackers, "tracker_list", ["RED", "OPS"])
+    monkeypatch.setattr(
+        cross_upload_module.salmon.trackers,
+        "get_class",
+        lambda code: (lambda: source_site if code == "RED" else target_site),
+    )
+    monkeypatch.setattr(cross_upload_module, "_resolve_input_items", fake_resolve)
+    monkeypatch.setattr(cross_upload_module, "_source_response", fake_source_response)
+    monkeypatch.setattr(cross_upload_module, "_upload_response", fake_upload_response)
+
+    anyio.run(
+        partial(
+            cross_upload_module.cross_upload.callback,
+            "Album A",
+            "RED",
+            "OPS",
+            False,
+            None,
+            True,
+            (),
+            inject=False,
+            additional_inputs=("Album B",),
+            also_source=True,
+        )
+    )
+
+    assert authenticated == ["OPS", "RED"]
+    assert [(source, target) for source, target, _kwargs in calls] == [
+        ("RED", "OPS"),
+        ("RED", "RED"),
+        ("RED", "OPS"),
+        ("RED", "RED"),
+    ]
+    assert [kwargs.get("target_group_id") for _source, _target, kwargs in calls] == [None, 7, None, 8]
+    assert all(kwargs["all_formats"] is True for _source, _target, kwargs in calls)
 
 
 def test_generated_torrents_are_reintroduced_beside_server_content(tmp_path: Path) -> None:
