@@ -71,7 +71,7 @@ class CrossUploadResult:
     skipped: bool = False
 
 
-@commandgroup.command()
+@commandgroup.command("cross")
 @click.option(
     "--inject/--no-inject",
     default=True,
@@ -87,7 +87,7 @@ class CrossUploadResult:
     "--all-formats",
     "--all",
     is_flag=True,
-    help="Upload every possible downconversion and MP3 transcode.",
+    help="From each FLAC, also upload missing MP3 320/V0 and, for 24-bit sources, 16-bit FLAC.",
 )
 @click.option(
     "--transcode",
@@ -146,9 +146,9 @@ async def cross_upload(
 
     \b
     Examples:
-      salmon cross-upload 456 RED OPS --all
-      salmon cross-upload "Album A" RED OPS --input "Album B" --all --also-source
-      salmon cross-upload 456 RED OPS --target-group-id 123 --transcode 320 --transcode V0
+      salmon cross 456 RED OPS --all
+      salmon cross "Album A" RED OPS --input "Album B" --all --also-source
+      salmon cross 456 RED OPS --target-group-id 123 --transcode 320 --transcode V0
     """
     source, target = source.upper(), target.upper()
     if also_source and not (downconvert or all_formats or transcodes):
@@ -505,6 +505,7 @@ async def _upload_response(
                 searchstrs,
                 offer_deletion=False,
                 results=results,
+                check_recent=False,
             )
     if upload_group_id:
         target_group = await target_site.torrentgroup(upload_group_id)

@@ -169,6 +169,7 @@ async def check_existing_group(
     offer_deletion: bool = True,
     *,
     results: list[dict] | None = None,
+    check_recent: bool = True,
 ) -> int | None:
     """Check for existing group and prompt user for selection.
 
@@ -177,13 +178,14 @@ async def check_existing_group(
         searchstrs: Search strings for dupe checking.
         offer_deletion: Whether to offer folder deletion option.
         results: Optional search results already fetched by the caller.
+        check_recent: Whether to scan recent upload-log pages when browse has no results.
 
     Returns:
         Group ID or None for new group.
     """
     if results is None:
         results = await get_search_results(gazelle_site, searchstrs)
-    if not results and cfg.upload.requests.check_recent_uploads:
+    if check_recent and not results and cfg.upload.requests.check_recent_uploads:
         click.secho(f"Checking recent {gazelle_site.site_string} uploads...", fg="cyan", nl=False)
         recent_uploads = await dupe_check_recent_torrents(gazelle_site, searchstrs)
         click.secho(" done.", fg="cyan")

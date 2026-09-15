@@ -322,13 +322,13 @@ Configure either `torrent_client` or `qui_proxy_url`, not both.
 
 Then use the torrent name as `INPUT`:
 ```bash
-salmon cross-upload "Artist - Album" RED OPS
+salmon cross "Artist - Album" RED OPS
 ```
 
 To process several albums in one command, repeat `--input`. Add `--also-source` to upload
 the requested conversions to the existing source groups as well as the target tracker:
 ```bash
-salmon cross-upload "Artist A - Album A" RED OPS \
+salmon cross "Artist A - Album A" RED OPS \
   --input "Artist B - Album B" \
   --input "Artist C - Album C" \
   --all --also-source --no-inject
@@ -342,7 +342,7 @@ instead of `--all` when only specific MP3 encodings are wanted.
 To upload only—without adding anything to qBittorrent or placing a `.torrent` file in
 `dottorrents_dir`—use:
 ```bash
-salmon cross-upload "Artist - Album" RED OPS --no-inject
+salmon cross "Artist - Album" RED OPS --no-inject
 ```
 
 In this mode, Salmon generates the torrent in memory and sends its bytes only to the target tracker.
@@ -355,6 +355,9 @@ are then uploaded into that target group. By default, each generated target torr
 qBittorrent beside its existing content. Salmon verifies that the torrent root name equals the existing
 content directory name, then submits the torrent bytes with that directory's parent as qBittorrent's
 save path.
+
+The `cross` command does not scan the recent-upload log when browse returns no group; that
+scan fetches nine log pages and is reserved for the regular upload workflow.
 
 Salmon does require filesystem access to each absolute `content_path` returned by qBittorrent.
 There is deliberately no release-directory option under `[cross_seed]`: qBittorrent supplies the

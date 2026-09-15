@@ -43,6 +43,9 @@ class SourceSite:
         return {"torrent": {"id": 42}}
 
 
+def test_cross_command_uses_short_name() -> None:
+    assert cross_upload_module.cross_upload.name == "cross"
+
 def test_single_and_batch_inputs(tmp_path: Path) -> None:
     source = SourceSite()
     assert _input_items("42", source) == [42]
@@ -627,6 +630,7 @@ def test_target_duplicate_search_is_reused_and_reports_progress(tmp_path: Path, 
         return search_results
 
     async def fake_check(_site, _searchstrs, **kwargs):
+        assert kwargs["check_recent"] is False
         prompt_results.append(kwargs["results"])
         return 9
 
