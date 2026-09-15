@@ -1,8 +1,10 @@
 import asyncio
 import html
 import re
+from collections import deque
 from contextlib import suppress
 from http import HTTPStatus
+from time import monotonic
 from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
@@ -10,7 +12,6 @@ import aiohttp
 import asyncclick as click
 import msgspec
 from aiohttp import FormData
-from aiolimiter import AsyncLimiter
 from bs4 import BeautifulSoup
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
@@ -142,6 +143,32 @@ class HttpResponse(msgspec.Struct, frozen=True):
     status: int
 
 
+class _SlidingWindowRateLimiter:
+    """Limit request starts within a strict rolling time window."""
+
+    def __init__(self, max_requests: int, period_seconds: float) -> None:
+        self._max_requests = max_requests
+        self._period_seconds = period_seconds
+        self._request_starts: deque[float] = deque()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        """Wait until another request fits inside the rolling window."""
+        while True:
+            async with self._lock:
+                now = monotonic()
+                cutoff = now - self._period_seconds
+                while self._request_starts and self._request_starts[0] <= cutoff:
+                    self._request_starts.popleft()
+
+                if len(self._request_starts) < self._max_requests:
+                    self._request_starts.append(now)
+                    return
+
+                delay = self._request_starts[0] + self._period_seconds - now
+            await asyncio.sleep(delay)
+
+
 class BaseGazelleApi:
     """Base API client for Gazelle-based trackers."""
 
@@ -153,8 +180,8 @@ class BaseGazelleApi:
     site_string: str
     api_key: str = ""  # Optional, only for API key upload
 
-    # Rate limiter: 5 requests per 10 seconds (shared across all instances)
-    _rate_limiter = AsyncLimiter(5, 10)
+    # RED and OPS allow five API requests per rolling ten-second window.
+    # Use four to leave headroom for timing and untracked manual requests.
 
     def __init__(self) -> None:
         """Initialize the API client. Subclasses should call this after setting cookie/base_url."""
@@ -170,6 +197,7 @@ class BaseGazelleApi:
         self.authkey: str | None = None
         self.passkey: str | None = None
         self._authenticated = False
+        self._rate_limiter = _SlidingWindowRateLimiter(4, 10)
 
     def _get_cookies(self) -> dict[str, str]:
         """Get cookies dict for requests."""
@@ -225,7 +253,7 @@ class BaseGazelleApi:
             url: The URL to request.
             params: Query parameters.
             data: POST body data.
-            timeout_secs: Request timeout in seconds.
+            timeout_secs: Total request timeout in seconds.
             prefer_api_key: If True and api_key is set, use Authorization header
                 only (no cookie). If False or api_key is empty, use cookie only
                 (no Authorization header).
@@ -247,8 +275,8 @@ class BaseGazelleApi:
 
         try:
             timeout = aiohttp.ClientTimeout(total=timeout_secs)
+            await self._rate_limiter.acquire()
             async with (
-                self._rate_limiter,
                 aiohttp.ClientSession(timeout=timeout, cookies=cookies, headers=headers) as session,
                 session.request(method, url, params=params, data=data) as resp,
             ):
@@ -529,7 +557,11 @@ class BaseGazelleApi:
         data["auth"] = self.authkey
 
         response = await self._request(
-            "POST", url, data=_compose_form_data(files, data), timeout_secs=30, prefer_api_key=True
+            "POST",
+            url,
+            data=_compose_form_data(files, data),
+            timeout_secs=30,
+            prefer_api_key=True,
         )
         try:
             resp = msgspec.json.decode(response.text)
