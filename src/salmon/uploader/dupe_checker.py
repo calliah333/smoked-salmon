@@ -229,6 +229,7 @@ async def resolve_existing_group(
         results: Search results from fetch_existing_group_candidates.
         recent_uploads: Recent uploads from fetch_existing_group_candidates, or None.
         offer_deletion: Whether to offer folder deletion option.
+        results: Optional search results already fetched by the caller.
 
     Returns:
         Group ID or None for new group.
